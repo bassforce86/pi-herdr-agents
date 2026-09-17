@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
 	lstatSync,
 	readdirSync,
@@ -35,6 +35,10 @@ export interface CleanupManifest {
 	file: string;
 	value: JsonObject;
 }
+export interface HolderInspection {
+	blockers: string[];
+	warnings: string[];
+}
 export interface WorktreeInventoryEntry {
 	path: string;
 	sourceRepo?: string;
@@ -45,6 +49,7 @@ export interface WorktreeInventoryEntry {
 	manifest: CleanupManifest[];
 	classification: "eligible" | "blocked" | "unknown" | "out-of-scope";
 	blockers: string[];
+	warnings: string[];
 }
 
 /** All probes and effects are injectable; inventories never perform mutations. */
@@ -53,10 +58,13 @@ export interface WorktreeCleanupOperations {
 	managedRoot(): string;
 	realpath(path: string): string;
 	resolveSource(path: string): string;
-	inspectGit(path: string, sourceRepo: string): CleanupGitState;
+	inspectGit(
+		path: string,
+		sourceRepo: string,
+	): CleanupGitState | Promise<CleanupGitState>;
 	listHerdr(sourceRepo: string): HerdrWorktreeInfo[];
 	readManifests(): CleanupManifest[];
-	holders(entry: WorktreeInventoryEntry): Promise<string[]>;
+	holders(entry: WorktreeInventoryEntry): Promise<HolderInspection>;
 	exists(path: string): boolean;
 	preserve(entry: WorktreeInventoryEntry): string;
 	removeWorkspace(id: string): void;
@@ -71,6 +79,7 @@ export interface CleanupInput {
 export interface WorktreeRemovalResult {
 	status: "removed" | "blocked" | "failed" | "already-removed";
 	message: string;
+	warnings: string[];
 	entry?: WorktreeInventoryEntry;
 	preservationSha?: string;
 }
@@ -121,6 +130,7 @@ async function inspectEntry(
 		manifest: [],
 		classification: "unknown",
 		blockers: [],
+		warnings: [],
 	};
 	try {
 		const canonicalPath = ops.realpath(path);
@@ -131,14 +141,20 @@ async function inspectEntry(
 		entry.path = canonicalPath;
 		entry.sourceRepo = ops.realpath(ops.resolveSource(entry.path));
 		entry.contained = contained(ops.realpath(cwd), entry.sourceRepo);
-		entry.manifest = manifests.filter(
-			({ value }) =>
-				value.state !== "removed" &&
-				isString(value.path) &&
-				ops.exists(value.path) &&
-				ops.realpath(value.path) === entry.path,
-		);
-		entry.git = ops.inspectGit(entry.path, entry.sourceRepo);
+		entry.manifest = manifests.filter(({ value }) => {
+			if (value.state === "removed" || !isString(value.path)) return false;
+			try {
+				return (
+					ops.exists(value.path) && ops.realpath(value.path) === entry.path
+				);
+			} catch (error) {
+				// SAFETY: filesystem probes throw Node errors with an optional errno code.
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+				// Permission errors and symlink loops leave identity undecidable.
+				throw error;
+			}
+		});
+		entry.git = await ops.inspectGit(entry.path, entry.sourceRepo);
 		entry.branch = entry.git.branch;
 		entry.blockers.push(...cleanupBlockers(entry));
 		if (!entry.contained) {
@@ -168,7 +184,9 @@ async function inspectEntry(
 			)
 				throw new Error("Manifest and live worktree identity disagree");
 		}
-		entry.blockers.push(...(await ops.holders(entry)));
+		const holders = await ops.holders(entry);
+		entry.blockers.push(...holders.blockers);
+		entry.warnings.push(...holders.warnings);
 		entry.classification = !entry.git.registered
 			? "unknown"
 			: entry.blockers.length
@@ -199,7 +217,7 @@ export function formatWorktreeInventory(
 		rows
 			.map(
 				(row) =>
-					`${row.branch ?? "unknown branch"} — ${row.path}\nSource: ${row.sourceRepo ?? "unknown"} · workspace: ${row.workspaceId ?? "none"} · manifest: ${row.manifest.length ? row.manifest.map(({ value }) => value.state ?? "unknown").join(", ") : "absent"}\n${row.classification} · Git: ${row.git ? `${row.git.dirtyFiles} dirty, ${row.git.untrackedFiles} untracked, ${row.git.ignoredFiles} ignored, ${row.git.conflicts} conflicts` : "unknown"}${row.blockers.length ? ` · ${row.blockers.join("; ")}` : " · clean"}`,
+					`${row.branch ?? "unknown branch"} — ${row.path}\nSource: ${row.sourceRepo ?? "unknown"} · workspace: ${row.workspaceId ?? "none"} · manifest: ${row.manifest.length ? row.manifest.map(({ value }) => value.state ?? "unknown").join(", ") : "absent"}\n${row.classification} · Git: ${row.git ? `${row.git.dirtyFiles} dirty, ${row.git.untrackedFiles} untracked, ${row.git.ignoredFiles} ignored, ${row.git.conflicts} conflicts` : "unknown"}${row.blockers.length ? ` · ${row.blockers.join("; ")}` : " · clean"}${row.warnings.length ? `\nWarning: ${row.warnings.join("; ")}` : ""}`,
 			)
 			.join("\n\n") || "No managed worktrees found."
 	);
@@ -225,6 +243,18 @@ export async function removeContainedWorktree(
 	let ignoredFiles = 0;
 	let preservationAttempted = false;
 	let checkoutRemoved = false;
+	const observedWarnings = new Set<string>();
+	const finish = (
+		result: Omit<WorktreeRemovalResult, "warnings">,
+	): WorktreeRemovalResult => ({
+		...result,
+		warnings: [...observedWarnings],
+		message:
+			result.message +
+			(observedWarnings.size
+				? ` Warning: ${[...observedWarnings].join("; ")}`
+				: ""),
+	});
 	const ignoredNotice = () =>
 		ignoredFiles
 			? checkoutRemoved
@@ -246,6 +276,8 @@ export async function removeContainedWorktree(
 				row.branch === input.target ||
 				row.workspaceId === input.target,
 		);
+		for (const row of matches.length ? matches : rows)
+			for (const warning of row.warnings) observedWarnings.add(warning);
 		if (matches.length !== 1) {
 			const removed = ops
 				.readManifests()
@@ -262,11 +294,11 @@ export async function removeContainedWorktree(
 				isString(removed[0].value.path) &&
 				!ops.exists(removed[0].value.path)
 			)
-				return {
+				return finish({
 					status: "already-removed",
 					message: "Worktree already removed; branch retained.",
-				};
-			return {
+				});
+			return finish({
 				status: "blocked",
 				message: matches.length
 					? "Ambiguous target; use the exact worktree path."
@@ -276,7 +308,7 @@ export async function removeContainedWorktree(
 								.map((row) => `${row.path}: ${row.blockers.join("; ")}`)
 								.join("; ")}`
 						: "Target not found in managed inventory; nothing removed.",
-			};
+			});
 		}
 		// Never trust an inventory cached by the caller, or even the discovery pass.
 		entry = await inspectEntry(
@@ -285,6 +317,7 @@ export async function removeContainedWorktree(
 			ops,
 			ops.readManifests(),
 		);
+		for (const warning of entry.warnings) observedWarnings.add(warning);
 		ignoredFiles = entry.git?.ignoredFiles ?? 0;
 		const hardBlockers = entry.blockers.filter(
 			(blocker) => !blocker.startsWith("Dirty worktree:"),
@@ -294,11 +327,11 @@ export async function removeContainedWorktree(
 			hardBlockers.length ||
 			(entry.blockers.length && !input.preserve)
 		)
-			return {
+			return finish({
 				status: "blocked",
 				entry,
 				message: entry.blockers.join("; ") + ignoredNotice(),
-			};
+			});
 		if (entry.git && (entry.git.dirtyFiles || entry.git.untrackedFiles)) {
 			preservationAttempted = true;
 			preservationSha = ops.preserve(entry);
@@ -309,6 +342,7 @@ export async function removeContainedWorktree(
 				ops,
 				ops.readManifests(),
 			);
+			for (const warning of entry.warnings) observedWarnings.add(warning);
 			if (
 				entry.classification !== "eligible" ||
 				entry.sourceRepo !== before.sourceRepo ||
@@ -316,12 +350,12 @@ export async function removeContainedWorktree(
 				entry.workspaceId !== before.workspaceId ||
 				entry.git?.headSha !== preservationSha
 			)
-				return {
+				return finish({
 					status: "blocked",
 					entry,
 					preservationSha,
 					message: `Preserved ${preservationSha}, but reinspection blocks removal: ${entry.blockers.join("; ") || "identity changed"}${ignoredNotice()}`,
-				};
+				});
 		}
 		ignoredFiles = entry.git?.ignoredFiles ?? ignoredFiles;
 		if (!entry.sourceRepo) throw new Error("Source repository unknown");
@@ -344,19 +378,19 @@ export async function removeContainedWorktree(
 				);
 			}
 		}
-		return {
+		return finish({
 			status: "removed",
 			entry,
 			preservationSha,
 			message: `Removed ${entry.path}. Branch ${entry.branch} and its commits retained.${preservationSha ? ` Preservation commit: ${preservationSha}.` : ""}${ignoredNotice()}${warnings.length ? ` Warning: ${warnings.join("; ")}` : entry.manifest.length ? " Manifest marked removed." : " No reachable manifest (orphan)."}`,
-		};
+		});
 	} catch (error) {
-		return {
+		return finish({
 			status: "failed",
 			entry,
 			preservationSha,
 			message: `Removal failed: ${message(error)}${preservationSha ? `; preserved commit ${preservationSha}` : ""}${ignoredNotice()}`,
-		};
+		});
 	}
 }
 
@@ -412,7 +446,40 @@ function resolveSource(path: string): string {
 		throw new Error("Source Git directory mismatch");
 	return root;
 }
-function inspectGit(path: string, sourceRepo: string): CleanupGitState {
+/** Count NUL-delimited file paths without retaining the ignored-file listing. */
+function countIgnoredFiles(cwd: string): Promise<number> {
+	return new Promise((resolve, reject) => {
+		const child = spawn(
+			"git",
+			["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+			{
+				cwd,
+				stdio: ["ignore", "pipe", "ignore"],
+				timeout: CLEANUP_TIMEOUT_MS,
+				killSignal: "SIGKILL",
+			},
+		);
+		let count = 0;
+		child.stdout.on("data", (chunk: Buffer) => {
+			for (const byte of chunk) if (byte === 0) count++;
+		});
+		child.on("error", reject);
+		child.on("close", (code, signal) => {
+			if (code === 0) resolve(count);
+			else
+				reject(
+					new Error(
+						`Ignored-file inspection failed (${signal ?? `exit ${code}`})`,
+					),
+				);
+		});
+	});
+}
+
+async function inspectGit(
+	path: string,
+	sourceRepo: string,
+): Promise<CleanupGitState> {
 	const records = git(sourceRepo, ["worktree", "list", "--porcelain", "-z"])
 		.split("\0\0")
 		.map((record) => record.split("\0"));
@@ -465,15 +532,7 @@ function inspectGit(path: string, sourceRepo: string): CleanupGitState {
 		])
 			.split("\0")
 			.filter(Boolean).length,
-		ignoredFiles: git(path, [
-			"ls-files",
-			"--others",
-			"--ignored",
-			"--exclude-standard",
-			"-z",
-		])
-			.split("\0")
-			.filter(Boolean).length,
+		ignoredFiles: await countIgnoredFiles(path),
 		conflicts: git(path, ["diff", "--name-only", "--diff-filter=U", "-z"])
 			.split("\0")
 			.filter(Boolean).length,
@@ -483,82 +542,125 @@ function inspectGit(path: string, sourceRepo: string): CleanupGitState {
 	};
 }
 
-/** Detect background processes as well as Herdr's foreground agent. Unknown access blocks. */
+/** Individual visibility gaps warn; failed enumeration still blocks cleanup. */
 function processHolders(
 	path: string,
 	idleShellPids = new Set<number>(),
 	procRoot = "/proc",
-): string[] {
+	platform: NodeJS.Platform = process.platform,
+): HolderInspection {
 	const blockers: string[] = [];
+	const unreadable = new Set<string>();
 	const shellNames = new Set(["bash", "zsh", "fish", "sh", "dash"]);
 	if (!process.getuid) throw new Error("Process user identity unavailable");
-	if (process.platform === "linux") {
-		for (const pid of readdirSync(procRoot).filter((name) =>
-			/^\d+$/.test(name),
-		)) {
+	const uid = process.getuid();
+	if (platform === "linux") {
+		// Keep enumeration outside the per-process guard: total failure is a blocker.
+		const pids = readdirSync(procRoot).filter((name) => /^\d+$/.test(name));
+		if (!pids.length) throw new Error("Process enumeration returned no PIDs");
+		for (const pid of pids) {
 			try {
-				if (lstatSync(`${procRoot}/${pid}`).uid !== process.getuid?.())
-					continue;
-				const command = readFileSync(`${procRoot}/${pid}/comm`, "utf8").trim();
+				if (lstatSync(`${procRoot}/${pid}`).uid !== uid) continue;
+				let command = "";
+				try {
+					command = readFileSync(`${procRoot}/${pid}/comm`, "utf8").trim();
+				} catch {
+					// An unreadable name cannot exempt a runtime or hide a readable cwd.
+					unreadable.add(pid);
+				}
 				// A shell can exec a runtime without changing PID/process group.
 				if (idleShellPids.has(Number(pid)) && shellNames.has(command)) continue;
 				const cwd = realpathSync(`${procRoot}/${pid}/cwd`);
 				if (contained(path, cwd))
-					blockers.push(`Live process ${pid} (${command}) holds the checkout`);
+					blockers.push(`Live process ${pid} holds the checkout`);
 			} catch (error) {
-				// SAFETY: these filesystem calls throw Node errors with an optional errno code.
+				// SAFETY: filesystem probes throw Node errors with an optional errno code.
 				if (
 					["ENOENT", "ESRCH"].includes(
 						(error as NodeJS.ErrnoException).code ?? "",
 					)
 				) {
-					if (!exists(`${procRoot}/${pid}`)) continue;
-					// A zombie has no cwd and cannot hold a checkout. Missing cwd for
-					// a process that is still alive is not evidence of absence.
-					if (
-						/^State:\s+[ZX]/m.test(
-							readFileSync(`${procRoot}/${pid}/status`, "utf8"),
-						)
-					)
-						continue;
+					try {
+						// Confirm disappearance separately from unreadable status.
+						realpathSync(`${procRoot}/${pid}`);
+						if (
+							/^State:\s+[ZX]/m.test(
+								readFileSync(`${procRoot}/${pid}/status`, "utf8"),
+							)
+						) {
+							unreadable.delete(pid);
+							continue;
+						}
+					} catch {
+						// Missing status alone is not proof of process disappearance.
+						try {
+							realpathSync(`${procRoot}/${pid}`);
+						} catch (presenceError) {
+							// SAFETY: these are Node filesystem errors.
+							if (
+								["ENOENT", "ESRCH"].includes(
+									(presenceError as NodeJS.ErrnoException).code ?? "",
+								)
+							) {
+								unreadable.delete(pid);
+								continue;
+							}
+						}
+					}
 				}
-				throw new Error(
-					`Process ${pid} inspection unavailable: ${message(error)}`,
-				);
+				unreadable.add(pid);
 			}
 		}
-	} else if (process.platform === "darwin") {
-		// lsof supplies cwd and command records on macOS; failure is not evidence of absence.
-		const output = execFileSync(
-			"lsof",
-			[
-				"-n",
-				"-P",
-				"-a",
-				"-u",
-				String(process.getuid?.()),
-				"-d",
-				"cwd",
-				"-Fpcn",
-			],
-			{ encoding: "utf8", timeout: CLEANUP_TIMEOUT_MS, killSignal: "SIGKILL" },
-		);
-		let pid = "";
-		let command = "";
-		for (const line of output.split("\n")) {
-			if (line.startsWith("p")) pid = line.slice(1);
-			if (line.startsWith("c")) command = line.slice(1);
-			if (
-				line.startsWith("n") &&
-				!(idleShellPids.has(Number(pid)) && shellNames.has(command)) &&
-				contained(path, realpathSync(line.slice(1)))
-			)
-				blockers.push(`Live process ${pid} (${command}) holds the checkout`);
+	} else if (platform === "darwin") {
+		// A nonzero lsof exit is a global failure, even if partial stdout exists.
+		let output: string;
+		try {
+			output = execFileSync(
+				"lsof",
+				["-n", "-P", "-a", "-u", String(uid), "-d", "cwd", "-Fpcn"],
+				{
+					encoding: "utf8",
+					timeout: CLEANUP_TIMEOUT_MS,
+					killSignal: "SIGKILL",
+					stdio: ["ignore", "pipe", "pipe"],
+				},
+			);
+		} catch {
+			// Command errors may embed partial process output; never disclose it.
+			throw new Error("lsof failed to enumerate processes");
+		}
+		const records = output.split(/^p/m).slice(1);
+		if (!records.length)
+			throw new Error("Process enumeration returned no PIDs");
+		for (const record of records) {
+			const [pid, ...fields] = record.split("\n");
+			if (!/^\d+$/.test(pid))
+				throw new Error("Invalid process enumeration record");
+			const command = fields.find((line) => line.startsWith("c"))?.slice(1);
+			if (idleShellPids.has(Number(pid)) && command && shellNames.has(command))
+				continue;
+			const cwd = fields.find((line) => line.startsWith("n"))?.slice(1);
+			if (!command) unreadable.add(pid);
+			try {
+				if (!cwd || !isAbsolute(cwd))
+					throw new Error("Process cwd unavailable");
+				if (contained(path, realpathSync(cwd)))
+					blockers.push(`Live process ${pid} holds the checkout`);
+			} catch {
+				unreadable.add(pid);
+			}
 		}
 	} else {
-		throw new Error(`Process inspection unsupported on ${process.platform}`);
+		throw new Error(`Process inspection unsupported on ${platform}`);
 	}
-	return blockers;
+	const warnings = [
+		"Incomplete process coverage: same-user inspection is permission-limited; other-user processes are not inspected. A protected process could hold the checkout undetected.",
+	];
+	if (unreadable.size)
+		warnings.push(
+			`${unreadable.size} process(es) (PIDs ${[...unreadable].slice(0, 10).join(", ")}${unreadable.size > 10 ? ", …" : ""}) have unreadable details; not proven unrelated to the checkout.`,
+		);
+	return { blockers, warnings };
 }
 
 export const __worktreeCleanupTest__ = { processHolders };
@@ -623,8 +725,22 @@ export function createWorktreeCleanupOperations(input: {
 						);
 				}
 			}
-			blockers.push(...processHolders(entry.path, idleShellPids));
-			return blockers;
+			try {
+				const inspection = processHolders(entry.path, idleShellPids);
+				return {
+					blockers: [...blockers, ...inspection.blockers],
+					warnings: inspection.warnings,
+				};
+			} catch (error) {
+				// Preserve known children and leases even when global inspection fails.
+				return {
+					blockers: [
+						...blockers,
+						`Process inspection unavailable: ${message(error)}`,
+					],
+					warnings: [],
+				};
+			}
 		},
 		exists,
 		preserve: (entry) => {

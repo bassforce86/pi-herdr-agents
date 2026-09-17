@@ -4149,7 +4149,7 @@ export default function subagentsExtension(
 							: listHerdrWorktrees(ctx.cwd)
 									.map(
 										(worktree) =>
-											`${worktree.branch} — ${worktree.path}${worktree.workspaceId ? ` (${worktree.workspaceId})` : ""}`,
+											`${worktree.branch || "(detached HEAD)"} — ${worktree.path}${worktree.workspaceId ? ` (${worktree.workspaceId})` : ""}`,
 									)
 									.join("\n") || "No worktrees found.",
 						"info",

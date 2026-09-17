@@ -50,6 +50,24 @@ import {
 	type TestEnv,
 } from "./harness.ts";
 
+// Inventory blockers are not command completion; require Pi's warning notification.
+const dirtyCleanupWarning =
+	/^\s*Warning: Dirty worktree: 1 changed files, 1 untracked;/m;
+const staleDirtyInventory = [
+	"unrelated — /managed/other/task",
+	"Source: /other · workspace: none · manifest: absent",
+	"out-of-scope · Git: 1 dirty, 1 untracked, 0 ignored, 0 conflicts · Source repository is outside cwd containment; Dirty worktree: 1 changed files, 1 untracked; commit or request preserve explicitly",
+].join("\n");
+
+it("dirty cleanup warning matcher rejects stale inventory", () => {
+	assert.match(staleDirtyInventory, /Dirty worktree:/);
+	assert.doesNotMatch(staleDirtyInventory, dirtyCleanupWarning);
+	assert.match(
+		" Warning: Dirty worktree: 1 changed files, 1 untracked; commit or request preserve explicitly",
+		dirtyCleanupWarning,
+	);
+});
+
 const backends = getAvailableBackends();
 
 function getWorkspaceActiveTab(workspaceId: string): string | null {
@@ -442,7 +460,7 @@ for (const backend of backends) {
 			);
 		});
 
-		it("retains a completed worktree, refuses dirty cleanup, and explicitly removes it without deleting history", async () => {
+		it("retains a completed worktree, refuses dirty cleanup, and explicitly removes it without deleting history", async (t) => {
 			const id = uniqueId();
 			const branch = `integration/ticket-${id}`;
 			const ticketFile = `ticket-${id}.txt`;
@@ -477,7 +495,18 @@ for (const backend of backends) {
 				`After you receive the result, say WORKTREE_COMPLETE_${id} and repeat its worktree path.`,
 			].join("\n");
 
-			startPi(surface, env.dir, task);
+			const decoyExtension = join(env.dir, ".pi", "cleanup-decoy.ts");
+			writeFileSync(
+				decoyExtension,
+				`export default (pi) => {
+					pi.registerCommand("cleanup-inventory-decoy", {
+						handler: async (_args, ctx) => ctx.ui.notify(${JSON.stringify(`${staleDirtyInventory}\nSTALE_INVENTORY_${id}`)}, "info"),
+					});
+				};\n`,
+			);
+			startPi(surface, env.dir, task, {
+				extraArgs: `-e ${shellQuote(decoyExtension)}`,
+			});
 
 			let worktree:
 				| { path: string; branch: string; open_workspace_id: string }
@@ -540,16 +569,33 @@ for (const backend of backends) {
 					PI_TIMEOUT,
 					300,
 				);
+				// Put inventory-shaped stale output on screen on every host, even if
+				// no unrelated dirty managed checkout exists there.
+				runInPane(surface, "/cleanup-inventory-decoy");
+				const decoyScreen = await waitForScreen(
+					surface,
+					new RegExp(`STALE_INVENTORY_${id}`),
+					PI_TIMEOUT,
+					300,
+				);
+				assert.match(decoyScreen, /Dirty worktree:/);
+				assert.doesNotMatch(decoyScreen, dirtyCleanupWarning);
+				t.diagnostic(
+					"Stale inventory: old predicate accepts; warning predicate rejects.",
+				);
 				writeFileSync(
 					join(worktree.path, "uncommitted.txt"),
 					"retained dirty state\n",
 				);
 				runInPane(surface, `/worktree remove ${worktree.open_workspace_id}`);
-				await waitForScreen(surface, /Dirty worktree:/, PI_TIMEOUT, 300);
+				await waitForScreen(surface, dirtyCleanupWarning, PI_TIMEOUT, 300);
 				assert.equal(existsSync(worktree.path), true);
 				assert.equal(
 					readFileSync(join(worktree.path, "uncommitted.txt"), "utf8"),
 					"retained dirty state\n",
+				);
+				t.diagnostic(
+					"Dirty refusal notification observed; checkout and uncommitted file intact.",
 				);
 				execFileSync("git", ["add", "uncommitted.txt"], { cwd: worktree.path });
 				execFileSync("git", ["commit", "-qm", `Preserved ${id}`], {
@@ -593,6 +639,34 @@ for (const backend of backends) {
 					),
 					false,
 				);
+				t.diagnostic(
+					`History assertions passed: ${branch} = ${retainedHead}; Implement ${id} reachable; checkout ${worktree.path} and workspace ${worktree.open_workspace_id} absent; source ${env.dir}.`,
+				);
+			} catch (error) {
+				// Preserve evidence in the test log before finally/afterEach teardown.
+				for (const capture of [
+					() => `Parent screen:\n${readPane(surface, 300)}`,
+					() =>
+						`Source branch ${branch}: ${execFileSync("git", ["rev-parse", branch], { cwd: env.dir, encoding: "utf8" }).trim()}`,
+					() =>
+						readdirSync(env.dir, { recursive: true, encoding: "utf8" })
+							.filter(
+								(file) =>
+									file.includes("worktree-runs/") && file.endsWith(".json"),
+							)
+							.map(
+								(file) =>
+									`${file}:\n${readFileSync(join(env.dir, file), "utf8")}`,
+							)
+							.join("\n"),
+				]) {
+					try {
+						console.error(capture());
+					} catch (captureError) {
+						console.error("Cleanup diagnostic unavailable:", captureError);
+					}
+				}
+				throw error;
 			} finally {
 				// Cleanup must not mask body failures or require a perfectly clean tree.
 				if (worktree?.open_workspace_id) {

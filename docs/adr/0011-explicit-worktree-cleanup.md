@@ -15,11 +15,23 @@ removed after successful cleanup, but is not the authorization boundary.
 
 Discovery joins the managed filesystem root, Git registration and working-tree
 state, live Herdr workspace state, and current-session manifests. Unknown or
-conflicting evidence blocks removal. Machine-wide same-user process holders and
-persistent leases block removal; process names are not a runtime allowlist.
-Only Herdr-confirmed idle retained shell PIDs are exempt. Dirty work requires an
+conflicting eligibility evidence blocks removal, subject to the approved
+individual process-visibility exception below. Detected same-user process
+holders, known live children, and persistent leases block removal; process
+names are not a runtime allowlist. Only Herdr-confirmed idle retained shell
+PIDs are exempt, never active runtimes at those PIDs. Dirty work requires an
 explicit WIP preservation commit on the retained branch; detached HEAD,
 conflicts, locks, and initialized submodules cannot be bypassed.
+
+The approved process-visibility policy treats unreadable individual process
+details as non-blocking warnings, without an override flag. Inspection continues
+so one hidden process cannot mask an observable holder. Inventory and removal
+results report incomplete coverage separately from blockers, retaining warnings
+through rechecks, preservation, and failures when available. Reports use counts
+and bounded PID samples, not commands or environments. Linux uses `/proc`;
+macOS uses same-user `lsof` cwd records and warns for individual unreadable
+records. Unsupported platforms and failed global enumeration remain blockers;
+partial output from a failed `lsof` is not successful enumeration.
 
 Paths are canonicalized, so symlinked ancestors are supported while checkout
 symlinks escaping the managed root are blocked. Ignored files are counted and
@@ -52,7 +64,11 @@ commits are retained. Session start only reports inventory counts.
 Broad cwd values authorize broad repository subtrees, so callers must choose cwd
 deliberately. Worktrees are not sandboxes. Fresh eligibility checks reduce but
 cannot eliminate races with external writers; underlying refusals are surfaced,
-not overridden. Unavailable process inspection prevents removal. Restart
-inventory does not reattach watchers or rewrite other sessions' manifests.
+not overridden. Same-user process inspection is permission-limited, and
+other-user processes are not inspected. A protected process could hold the
+checkout undetected; unreadability is not proof that it is unrelated. This
+accepted blind spot replaces the earlier strict individual-unreadability
+blocker, not the global enumeration or identity guards. Restart inventory does
+not reattach watchers or rewrite other sessions' manifests.
 
 See the [operating guide](../worktree-subagents.md#cleanup) for the shipped API.

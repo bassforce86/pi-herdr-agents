@@ -379,6 +379,7 @@ export function createHerdrGroupedSurface(
 
 /** Worktree records returned by `herdr worktree list`. */
 export interface HerdrWorktreeInfo {
+	/** Empty for a detached HEAD, matching cleanup's Git inspection. */
 	branch: string;
 	path: string;
 	label?: string;
@@ -412,11 +413,16 @@ export function parseHerdrWorktreeList(output: string): HerdrWorktreeInfo[] {
 		throw new Error("Unexpected herdr worktree list output");
 	}
 	return worktrees.map((worktree) => {
-		if (!isString(worktree.branch) || !isString(worktree.path)) {
+		if (
+			!isPlainObject(worktree) ||
+			!isString(worktree.path) ||
+			(!isString(worktree.branch) &&
+				!(worktree.branch === undefined && worktree.is_detached === true))
+		) {
 			throw new Error("Unexpected herdr worktree list entry");
 		}
 		const info: HerdrWorktreeInfo = {
-			branch: worktree.branch,
+			branch: isString(worktree.branch) ? worktree.branch : "",
 			path: worktree.path,
 			isLinkedWorktree: worktree.is_linked_worktree === true,
 		};

@@ -23,7 +23,7 @@
 ## 5. /subagents-init command
 
 - [x] 5.1 Implement the native write seam: resolve the user config path, seed a missing file from packaged `config.json.example`, re-read before modify, replace only `models.tasks` and `models.tasksMeta`, validate schema plus exact-reference and authenticated-candidate checks, write atomically via temp file + rename, never touch the package directory, and verify with unit tests covering fresh-file seeding (all six sections still load, including status), existing unrelated keys preserved deep-equal, invalid candidates rejected without file change, and atomicity of the write path
-- [ ] 5.2 Register the `/subagents-init` command whose prompt directs the agent to dump the authenticated registry (registry object, not the catalog string), research current task-fit when web search is available (registry-only ranking otherwise, recorded in `tasksMeta.method`), submit the draft through the seam, and present the category table, generation metadata, and the `/reload` instruction, and verify by running the command end-to-end in a Pi session and inspecting the written config, section loadability, and summary
+- [x] 5.2 Register the `/subagents-init` command whose prompt directs the agent to dump the authenticated registry (registry object, not the catalog string), research current task-fit when web search is available (registry-only ranking otherwise, recorded in `tasksMeta.method`), submit the draft through the seam, and present the category table, generation metadata, and the `/reload` instruction, and verify by running the command end-to-end in a Pi session and inspecting the written config, section loadability, and summary
 
 ## 6. Documentation and vocabulary
 

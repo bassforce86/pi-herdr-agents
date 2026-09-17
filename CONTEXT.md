@@ -99,3 +99,28 @@ _Avoid_: Completed agent process, disposable pane, automatic worktree cleanup
 The lifetime-exclusive binding between a persistent specialist generation and
 one managed worktree, when that specialist writes in a worktree.
 _Avoid_: Rebindable checkout, shared worktree ownership
+
+**Worktree inventory**:
+An inspect-only view joining managed checkout discovery, Git registration/state,
+Herdr workspace association, and reachable owned manifests, including orphans.
+_Avoid_: Session-only resource list, cleanup action
+
+**Cwd containment**:
+Cleanup authorization requiring the canonical source repository root to equal or
+be a descendant of the invoking session's canonical cwd.
+_Avoid_: Managed-path containment, manifest ownership authorization
+
+**Cleanup eligibility**:
+Fresh evidence of cwd containment, registered checkout identity, no live child or
+persistent lease, and clean Git state. Unknown evidence blocks removal.
+_Avoid_: Guessed idle, presumed clean
+
+**Explicit worktree removal**:
+A parent-requested removal of one named managed checkout and its open workspace,
+with absence verification and retained branch history. Never automatic reaping.
+_Avoid_: Branch deletion, completion cleanup
+
+**Dirty-state preservation**:
+Explicit opt-in staging and WIP commitment of a worktree's uncommitted and
+untracked files on its retained branch before rechecking removal eligibility.
+_Avoid_: Implicit commit, stash, discard

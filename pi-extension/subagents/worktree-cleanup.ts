@@ -1,0 +1,558 @@
+import { execFileSync } from "node:child_process";
+import { lstatSync, readdirSync, realpathSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import {
+	getHerdrPaneProcessInfo,
+	listHerdrPanes,
+	listHerdrWorktrees,
+	removeHerdrWorktree,
+	type HerdrWorktreeInfo,
+} from "./herdr.ts";
+import { readWorktreeManifest, writeWorktreeManifest } from "./launch.ts";
+import { isString, type JsonObject } from "./type-guards.ts";
+
+export interface CleanupGitState {
+	branch: string;
+	headSha: string;
+	registered: boolean;
+	locked: boolean;
+	dirtyFiles: number;
+	untrackedFiles: number;
+	conflicts: number;
+	submodules: boolean;
+}
+
+export interface CleanupManifest {
+	file: string;
+	value: JsonObject;
+}
+export interface WorktreeInventoryEntry {
+	path: string;
+	sourceRepo?: string;
+	branch?: string;
+	workspaceId?: string;
+	contained: boolean;
+	git?: CleanupGitState;
+	manifest: CleanupManifest[];
+	classification: "eligible" | "blocked" | "unknown" | "out-of-scope";
+	blockers: string[];
+}
+
+/** All probes and effects are injectable; inventories never perform mutations. */
+export interface WorktreeCleanupOperations {
+	scan(): string[];
+	realpath(path: string): string;
+	resolveSource(path: string): string;
+	inspectGit(path: string, sourceRepo: string): CleanupGitState;
+	listHerdr(sourceRepo: string): HerdrWorktreeInfo[];
+	readManifests(): CleanupManifest[];
+	holders(entry: WorktreeInventoryEntry): Promise<string[]>;
+	exists(path: string): boolean;
+	preserve(entry: WorktreeInventoryEntry): string;
+	removeWorkspace(id: string): void;
+	removeCheckout(sourceRepo: string, path: string): void;
+	prune(sourceRepo: string): void;
+	writeManifest(file: string, value: JsonObject): void;
+}
+export interface CleanupInput {
+	cwd: string;
+	operations: WorktreeCleanupOperations;
+}
+export interface WorktreeRemovalResult {
+	status: "removed" | "blocked" | "failed" | "already-removed";
+	message: string;
+	entry?: WorktreeInventoryEntry;
+	preservationSha?: string;
+}
+
+function message(error: any): string {
+	return error instanceof Error ? error.message : String(error);
+}
+function contained(root: string, path: string): boolean {
+	const rel = relative(root, path);
+	return (
+		rel === "" ||
+		(rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
+	);
+}
+
+export function cleanupBlockers(entry: WorktreeInventoryEntry): string[] {
+	const git = entry.git;
+	const blockers: string[] = [];
+	if (!entry.contained)
+		blockers.push("Source repository is outside cwd containment");
+	if (!git) return [...blockers, "Git state is unknown"];
+	if (!git.registered)
+		blockers.push("Not a registered linked worktree (unknown residue)");
+	if (!git.branch) blockers.push("Detached HEAD: no retained branch");
+	if (git.locked) blockers.push("Git worktree is locked");
+	if (git.conflicts)
+		blockers.push(`${git.conflicts} conflicted files; resolve conflicts first`);
+	if (git.submodules)
+		blockers.push(
+			"Initialized submodules: deinitialize them or use operator removal",
+		);
+	if (git.dirtyFiles || git.untrackedFiles)
+		blockers.push(
+			`Dirty worktree: ${git.dirtyFiles} changed files, ${git.untrackedFiles} untracked; commit or request preserve explicitly`,
+		);
+	return blockers;
+}
+
+async function inspectEntry(
+	path: string,
+	cwd: string,
+	ops: WorktreeCleanupOperations,
+	manifests: CleanupManifest[],
+): Promise<WorktreeInventoryEntry> {
+	const entry: WorktreeInventoryEntry = {
+		path,
+		contained: false,
+		manifest: [],
+		classification: "unknown",
+		blockers: [],
+	};
+	try {
+		const canonicalPath = ops.realpath(path);
+		if (canonicalPath !== resolve(path))
+			throw new Error(
+				"Managed checkout path is a symlink alias; inspect residue manually",
+			);
+		entry.path = canonicalPath;
+		entry.sourceRepo = ops.realpath(ops.resolveSource(entry.path));
+		entry.contained = contained(ops.realpath(cwd), entry.sourceRepo);
+		entry.manifest = manifests.filter(
+			({ value }) => isString(value.path) && resolve(value.path) === entry.path,
+		);
+		entry.git = ops.inspectGit(entry.path, entry.sourceRepo);
+		entry.branch = entry.git.branch;
+		entry.blockers.push(...cleanupBlockers(entry));
+		if (!entry.contained) {
+			entry.classification = "out-of-scope";
+			return entry;
+		}
+		const matches = ops
+			.listHerdr(entry.sourceRepo)
+			.filter((row) => ops.realpath(row.path) === entry.path);
+		if (
+			matches.length > 1 ||
+			matches.some(
+				(row) => !row.isLinkedWorktree || row.branch !== entry.branch,
+			)
+		)
+			throw new Error("Git and Herdr worktree identity disagree");
+		entry.workspaceId = matches[0]?.workspaceId;
+		for (const { value } of entry.manifest) {
+			if (
+				value.branch !== entry.branch ||
+				value.state === "removed" ||
+				(isString(value.sourceCwd) &&
+					ops.realpath(ops.resolveSource(value.sourceCwd)) !==
+						entry.sourceRepo) ||
+				(isString(value.workspaceId) &&
+					entry.workspaceId &&
+					value.workspaceId !== entry.workspaceId)
+			)
+				throw new Error("Manifest and live worktree identity disagree");
+		}
+		entry.blockers.push(...(await ops.holders(entry)));
+		entry.classification = !entry.git.registered
+			? "unknown"
+			: entry.blockers.length
+				? "blocked"
+				: "eligible";
+	} catch (error) {
+		entry.blockers.push(`Inspection unavailable: ${message(error)}`);
+		entry.classification = "unknown";
+	}
+	return entry;
+}
+
+export async function listContainedWorktrees({
+	cwd,
+	operations: ops,
+}: CleanupInput): Promise<WorktreeInventoryEntry[]> {
+	const manifests = ops.readManifests();
+	const rows: WorktreeInventoryEntry[] = [];
+	for (const path of new Set(ops.scan()))
+		rows.push(await inspectEntry(path, cwd, ops, manifests));
+	return rows;
+}
+
+export function formatWorktreeInventory(
+	rows: WorktreeInventoryEntry[],
+): string {
+	return (
+		rows
+			.map(
+				(row) =>
+					`${row.branch ?? "unknown branch"} — ${row.path}\nSource: ${row.sourceRepo ?? "unknown"} · workspace: ${row.workspaceId ?? "none"} · manifest: ${row.manifest.length ? row.manifest.map(({ value }) => value.state ?? "unknown").join(", ") : "absent"}\n${row.classification} · Git: ${row.git ? `${row.git.dirtyFiles} dirty, ${row.git.untrackedFiles} untracked, ${row.git.conflicts} conflicts` : "unknown"}${row.blockers.length ? ` · ${row.blockers.join("; ")}` : " · clean"}`,
+			)
+			.join("\n\n") || "No managed worktrees found."
+	);
+}
+
+export function worktreeInventoryNotice(
+	rows: WorktreeInventoryEntry[],
+): string | undefined {
+	const present = rows.filter((row) => row.contained);
+	if (!present.length) return undefined;
+	const eligible = present.filter(
+		(row) => row.classification === "eligible",
+	).length;
+	return `Worktrees: ${present.length} present · ${eligible} eligible · ${present.length - eligible} blocked. /worktree list`;
+}
+
+export async function removeContainedWorktree(
+	input: CleanupInput & { target: string; preserve?: boolean },
+): Promise<WorktreeRemovalResult> {
+	const { operations: ops } = input;
+	let entry: WorktreeInventoryEntry | undefined;
+	let preservationSha: string | undefined;
+	try {
+		const rows = await listContainedWorktrees(input);
+		const matches = rows.filter(
+			(row) =>
+				row.path === input.target ||
+				row.branch === input.target ||
+				row.workspaceId === input.target,
+		);
+		if (matches.length !== 1) {
+			const removed = ops
+				.readManifests()
+				.filter(
+					({ value }) =>
+						value.state === "removed" &&
+						(value.path === input.target ||
+							value.branch === input.target ||
+							value.workspaceId === input.target),
+				);
+			if (
+				!matches.length &&
+				removed.length === 1 &&
+				isString(removed[0].value.path) &&
+				!ops.exists(removed[0].value.path)
+			)
+				return {
+					status: "already-removed",
+					message: "Worktree already removed; branch retained.",
+				};
+			return {
+				status: "blocked",
+				message: matches.length
+					? "Ambiguous target; use the exact worktree path."
+					: "Target not found in managed inventory; nothing removed.",
+			};
+		}
+		// Never trust an inventory cached by the caller, or even the discovery pass.
+		entry = await inspectEntry(
+			matches[0].path,
+			input.cwd,
+			ops,
+			ops.readManifests(),
+		);
+		const hardBlockers = entry.blockers.filter(
+			(blocker) => !blocker.startsWith("Dirty worktree:"),
+		);
+		if (
+			entry.classification === "unknown" ||
+			hardBlockers.length ||
+			(entry.blockers.length && !input.preserve)
+		)
+			return { status: "blocked", entry, message: entry.blockers.join("; ") };
+		if (entry.git && (entry.git.dirtyFiles || entry.git.untrackedFiles)) {
+			preservationSha = ops.preserve(entry);
+			const before = entry;
+			entry = await inspectEntry(
+				entry.path,
+				input.cwd,
+				ops,
+				ops.readManifests(),
+			);
+			if (
+				entry.classification !== "eligible" ||
+				entry.sourceRepo !== before.sourceRepo ||
+				entry.branch !== before.branch ||
+				entry.workspaceId !== before.workspaceId ||
+				entry.git?.headSha !== preservationSha
+			)
+				return {
+					status: "blocked",
+					entry,
+					preservationSha,
+					message: `Preserved ${preservationSha}, but reinspection blocks removal: ${entry.blockers.join("; ") || "identity changed"}`,
+				};
+		}
+		if (!entry.sourceRepo) throw new Error("Source repository unknown");
+		if (entry.workspaceId) ops.removeWorkspace(entry.workspaceId);
+		else ops.removeCheckout(entry.sourceRepo, entry.path);
+		if (ops.exists(entry.path))
+			throw new Error("Removal left the checkout present");
+		if (!entry.workspaceId) ops.prune(entry.sourceRepo);
+		for (const manifest of entry.manifest)
+			ops.writeManifest(manifest.file, {
+				state: "removed",
+				workspaceRemovedAt: Date.now(),
+			});
+		return {
+			status: "removed",
+			entry,
+			preservationSha,
+			message: `Removed ${entry.path}. Branch ${entry.branch} and its commits retained.${preservationSha ? ` Preservation commit: ${preservationSha}.` : ""}${entry.manifest.length ? " Manifest marked removed." : " No reachable manifest (orphan)."}`,
+		};
+	} catch (error) {
+		return {
+			status: "failed",
+			entry,
+			preservationSha,
+			message: `Removal failed: ${message(error)}${preservationSha ? `; preserved commit ${preservationSha}` : ""}`,
+		};
+	}
+}
+
+function git(cwd: string, args: string[]): string {
+	return execFileSync("git", args, {
+		cwd,
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+}
+function exists(path: string): boolean {
+	try {
+		lstatSync(path);
+		return true;
+	} catch (error) {
+		// SAFETY: filesystem calls throw Node errors with an optional errno code.
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
+	}
+}
+function directories(path: string): string[] {
+	if (!exists(path)) return [];
+	return readdirSync(path, { withFileTypes: true })
+		.filter((item) => item.isDirectory() || item.isSymbolicLink())
+		.map((item) => join(path, item.name));
+}
+
+/** Source identity is resolved independently of status so Git failures remain visible. */
+function resolveSource(path: string): string {
+	const common = realpathSync(
+		git(path, [
+			"rev-parse",
+			"--path-format=absolute",
+			"--git-common-dir",
+		]).trim(),
+	);
+	const root = realpathSync(dirname(common));
+	if (realpathSync(git(root, ["rev-parse", "--show-toplevel"]).trim()) !== root)
+		throw new Error("Cannot prove source repository root");
+	if (
+		realpathSync(
+			git(root, [
+				"rev-parse",
+				"--path-format=absolute",
+				"--git-common-dir",
+			]).trim(),
+		) !== common
+	)
+		throw new Error("Source Git directory mismatch");
+	return root;
+}
+function inspectGit(path: string, sourceRepo: string): CleanupGitState {
+	const records = git(sourceRepo, ["worktree", "list", "--porcelain", "-z"])
+		.split("\0\0")
+		.map((record) => record.split("\0"));
+	const record = records.find((fields) => fields[0] === `worktree ${path}`);
+	const branch = git(path, ["symbolic-ref", "-q", "HEAD"])
+		.trim()
+		.replace(/^refs\/heads\//, "");
+	const status = git(path, [
+		"status",
+		"--porcelain=v1",
+		"--untracked-files=all",
+		"-z",
+	]);
+	let dirtyFiles = 0;
+	const fields = status.split("\0");
+	for (let i = 0; i < fields.length; i++) {
+		if (!fields[i]) continue;
+		dirtyFiles++;
+		if (/^[RC]|^.[RC]/.test(fields[i])) i++;
+	}
+	return {
+		branch,
+		headSha: git(path, ["rev-parse", "HEAD"]).trim(),
+		registered:
+			!!record &&
+			path !== sourceRepo &&
+			record.includes(`branch refs/heads/${branch}`),
+		locked: !!record?.some(
+			(field) => field === "locked" || field.startsWith("locked "),
+		),
+		dirtyFiles,
+		untrackedFiles: git(path, [
+			"ls-files",
+			"--others",
+			"--exclude-standard",
+			"-z",
+		])
+			.split("\0")
+			.filter(Boolean).length,
+		conflicts: git(path, ["diff", "--name-only", "--diff-filter=U", "-z"])
+			.split("\0")
+			.filter(Boolean).length,
+		submodules: git(path, ["submodule", "status", "--recursive"])
+			.split("\n")
+			.some((line) => line.length > 0 && !line.startsWith("-")),
+	};
+}
+
+/** Detect background processes as well as Herdr's foreground agent. Unknown access blocks. */
+function processHolders(path: string): string[] {
+	const blockers: string[] = [];
+	if (process.platform === "linux") {
+		for (const pid of readdirSync("/proc").filter((name) =>
+			/^\d+$/.test(name),
+		)) {
+			try {
+				if (lstatSync(`/proc/${pid}`).uid !== process.getuid?.()) continue;
+				const command = readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+				// Pi is a Node process (or a named Pi/Bun runtime). Unrelated protected
+				// daemons such as gpg-agent do not establish a child or specialist lease.
+				if (!["pi", "node", "bun", "deno", "MainThread"].includes(command))
+					continue;
+				const cwd = realpathSync(`/proc/${pid}/cwd`);
+				if (contained(path, cwd))
+					blockers.push(
+						`Live Pi runtime process ${pid} (${command}) holds the checkout`,
+					);
+			} catch (error) {
+				// SAFETY: these filesystem calls throw Node errors with an optional errno code.
+				if (
+					["ENOENT", "ESRCH"].includes(
+						(error as NodeJS.ErrnoException).code ?? "",
+					)
+				)
+					continue;
+				throw error;
+			}
+		}
+	} else {
+		// lsof supplies cwd and command records on macOS; failure is not evidence of absence.
+		const output = execFileSync(
+			"lsof",
+			[
+				"-n",
+				"-P",
+				"-a",
+				"-u",
+				String(process.getuid?.()),
+				"-d",
+				"cwd",
+				"-Fpcn",
+			],
+			{ encoding: "utf8" },
+		);
+		let pid = "";
+		let command = "";
+		for (const line of output.split("\n")) {
+			if (line.startsWith("p")) pid = line.slice(1);
+			if (line.startsWith("c")) command = line.slice(1);
+			if (
+				line.startsWith("n") &&
+				contained(path, line.slice(1)) &&
+				!["bash", "zsh", "fish", "sh", "dash"].includes(command)
+			)
+				blockers.push(`Live process ${pid} (${command}) holds the checkout`);
+		}
+	}
+	return blockers;
+}
+
+export function createWorktreeCleanupOperations(input: {
+	manifestDir: string;
+	liveHolders: () => { path: string; persistent?: boolean }[];
+	managedRoot?: string;
+}): WorktreeCleanupOperations {
+	return {
+		scan: () =>
+			directories(
+				input.managedRoot ?? join(homedir(), ".herdr", "worktrees"),
+			).flatMap(directories),
+		realpath: realpathSync,
+		resolveSource,
+		inspectGit,
+		listHerdr: listHerdrWorktrees,
+		readManifests: () => {
+			if (!exists(input.manifestDir)) return [];
+			return readdirSync(input.manifestDir)
+				.filter((name) => name.endsWith(".json"))
+				.flatMap((name) => {
+					const file = join(input.manifestDir, name);
+					const value = readWorktreeManifest(file);
+					return value ? [{ file, value }] : [];
+				});
+		},
+		holders: async (entry) => {
+			const blockers: string[] = input
+				.liveHolders()
+				.filter((holder) => realpathSync(holder.path) === entry.path)
+				.map((holder) =>
+					holder.persistent
+						? "Persistent-specialist lease holds the worktree"
+						: "Live child holds the worktree",
+				);
+			blockers.push(...processHolders(entry.path));
+			if (entry.workspaceId) {
+				const panes = await listHerdrPanes();
+				if (!panes) throw new Error("Herdr pane snapshot unavailable");
+				const owned = panes.filter(
+					(pane) => pane.workspaceId === entry.workspaceId,
+				);
+				if (!owned.length)
+					throw new Error("Open workspace has no observable panes");
+				for (const pane of owned) {
+					const info = getHerdrPaneProcessInfo(pane.paneId);
+					if (!info.shellPid || !info.foregroundProcessGroupId)
+						throw new Error(`Process state unknown for pane ${pane.paneId}`);
+					if (info.foregroundProcessGroupId !== info.shellPid)
+						blockers.push(
+							`Live child or foreground process in pane ${pane.paneId}`,
+						);
+				}
+			}
+			return blockers;
+		},
+		exists,
+		preserve: (entry) => {
+			if (
+				!entry.branch ||
+				git(entry.path, ["symbolic-ref", "--short", "HEAD"]).trim() !==
+					entry.branch
+			)
+				throw new Error("Retained branch changed before preservation");
+			git(entry.path, ["add", "-A"]);
+			git(entry.path, [
+				"commit",
+				"-m",
+				"WIP: preserve worktree before explicit cleanup",
+			]);
+			return git(entry.path, ["rev-parse", "HEAD"]).trim();
+		},
+		removeWorkspace: removeHerdrWorktree,
+		removeCheckout: (source, path) => {
+			git(source, ["worktree", "remove", "--", path]);
+		},
+		prune: (source) => {
+			git(source, ["worktree", "prune"]);
+		},
+		writeManifest: (file, value) => {
+			if (!readWorktreeManifest(file))
+				throw new Error(
+					"Manifest ownership became unavailable; checkout removed but manifest unchanged",
+				);
+			writeWorktreeManifest(file, value);
+		},
+	};
+}

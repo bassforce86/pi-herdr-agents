@@ -442,7 +442,7 @@ for (const backend of backends) {
 			);
 		});
 
-		it("runs a writing subagent in a retained Herdr worktree", async () => {
+		it("retains a completed worktree, refuses dirty cleanup, and explicitly removes it without deleting history", async () => {
 			const id = uniqueId();
 			const branch = `integration/ticket-${id}`;
 			const ticketFile = `ticket-${id}.txt`;
@@ -532,6 +532,66 @@ for (const backend of backends) {
 				assert.ok(
 					worktree.open_workspace_id,
 					"Completed worktree workspace should remain open",
+				);
+				runInPane(surface, "/worktree list");
+				await waitForScreen(
+					surface,
+					/eligible · Git: 0 dirty/,
+					PI_TIMEOUT,
+					300,
+				);
+				writeFileSync(
+					join(worktree.path, "uncommitted.txt"),
+					"retained dirty state\n",
+				);
+				runInPane(surface, `/worktree remove ${worktree.open_workspace_id}`);
+				await waitForScreen(surface, /Dirty worktree:/, PI_TIMEOUT, 300);
+				assert.equal(existsSync(worktree.path), true);
+				assert.equal(
+					readFileSync(join(worktree.path, "uncommitted.txt"), "utf8"),
+					"retained dirty state\n",
+				);
+				execFileSync("git", ["add", "uncommitted.txt"], { cwd: worktree.path });
+				execFileSync("git", ["commit", "-qm", `Preserved ${id}`], {
+					cwd: worktree.path,
+				});
+				const retainedHead = execFileSync("git", ["rev-parse", "HEAD"], {
+					cwd: worktree.path,
+					encoding: "utf8",
+				}).trim();
+				runInPane(surface, `/worktree remove ${worktree.open_workspace_id}`);
+				await waitForScreen(surface, /commits retained/, PI_TIMEOUT, 300);
+				assert.equal(existsSync(worktree.path), false);
+				assert.match(
+					execFileSync("git", ["branch", "--list", branch], {
+						cwd: env.dir,
+						encoding: "utf8",
+					}),
+					new RegExp(branch),
+				);
+				assert.equal(
+					execFileSync("git", ["rev-parse", branch], {
+						cwd: env.dir,
+						encoding: "utf8",
+					}).trim(),
+					retainedHead,
+				);
+				assert.match(
+					execFileSync("git", ["log", "--format=%s", branch], {
+						cwd: env.dir,
+						encoding: "utf8",
+					}),
+					new RegExp(`Implement ${id}`),
+				);
+				const remaining = JSON.parse(
+					execFileSync("herdr", ["workspace", "list"], { encoding: "utf8" }),
+				).result.workspaces;
+				assert.equal(
+					remaining.some(
+						(workspace: { workspace_id: string }) =>
+							workspace.workspace_id === worktree.open_workspace_id,
+					),
+					false,
 				);
 			} finally {
 				// Cleanup must not mask body failures or require a perfectly clean tree.

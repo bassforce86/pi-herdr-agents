@@ -1,4 +1,5 @@
 import { describe, it, before, after } from "node:test";
+import { cleanupFixture } from "./worktree-cleanup.test.ts";
 import assert from "node:assert/strict";
 import {
 	existsSync,
@@ -5369,7 +5370,7 @@ describe("commands", () => {
 		);
 	});
 
-	it("registers /worktree with only its list subcommand", async () => {
+	it("registers /worktree with list and explicit remove usage", async () => {
 		const { api, registeredCommands } = createMockExtensionApi();
 		subagentsModule.default(api);
 
@@ -5393,11 +5394,13 @@ describe("commands", () => {
 		await worktree.handler("list extra", ctx);
 		assert.deepEqual(notifications, [
 			{
-				message: "Usage: /worktree <name> [task] | /worktree list",
+				message:
+					"Usage: /worktree <name> [task] | /worktree list | /worktree remove <target> [--preserve]",
 				level: "warning",
 			},
 			{
-				message: "Usage: /worktree <name> [task] | /worktree list",
+				message:
+					"Usage: /worktree <name> [task] | /worktree list | /worktree remove <target> [--preserve]",
 				level: "warning",
 			},
 		]);
@@ -5468,6 +5471,88 @@ describe("commands", () => {
 		assert.match(sentUserMessages[0], /fork: true/);
 		assert.match(sentUserMessages[0], /interactive: true/);
 		assert.match(sentUserMessages[0], /name: "Iterate"/);
+	});
+});
+
+describe("worktree cleanup public surface", () => {
+	it("registers parent tools, dispatches list/remove, and reports session-start inventory once", async () => {
+		const f = cleanupFixture();
+		const { api, registeredTools, registeredCommands, eventHandlers } =
+			createMockExtensionApi();
+		subagentsModule.default(api, { cleanupOperations: () => f.operations });
+		const notices: string[] = [];
+		const ctx = {
+			cwd: "/repo",
+			hasUI: true,
+			modelRegistry: { getAvailable: () => [] },
+			ui: { notify: (text: string) => notices.push(text) },
+		};
+		const list = registeredTools.find((tool) => tool.name === "worktree_list");
+		const remove = registeredTools.find(
+			(tool) => tool.name === "worktree_remove",
+		);
+		assert.ok(list);
+		assert.ok(remove);
+		const result = await list.execute("id", {}, undefined, undefined, ctx);
+		assert.equal(result.details.entries[0].classification, "eligible");
+		await eventHandlers.get("session_start")![0]({}, ctx);
+		assert.equal(notices.length, 1);
+		assert.match(notices[0], /1 present · 1 eligible · 0 blocked/);
+		assert.deepEqual(f.calls, []);
+		const command = registeredCommands.find(
+			(item) => item.name === "worktree",
+		)!;
+		await command.handler("remove task", ctx);
+		assert.match(notices.at(-1)!, /Removed/);
+		assert.deepEqual(f.calls, ["git:/repo:/managed/repo/task", "prune:/repo"]);
+		const count = notices.length;
+		await eventHandlers.get("session_start")![0]({}, ctx);
+		assert.equal(notices.length, count);
+	});
+	it("dispatches preserve explicitly from the tool and command", async () => {
+		for (const surface of ["tool", "command"]) {
+			const f = cleanupFixture();
+			f.state.dirtyFiles = 1;
+			const { api, registeredTools, registeredCommands } =
+				createMockExtensionApi();
+			subagentsModule.default(api, { cleanupOperations: () => f.operations });
+			const ctx = { cwd: "/repo", ui: { notify: () => {} } };
+			if (surface === "tool")
+				await registeredTools
+					.find((tool) => tool.name === "worktree_remove")!
+					.execute(
+						"id",
+						{ target: "task", preserve: true },
+						undefined,
+						undefined,
+						ctx,
+					);
+			else
+				await registeredCommands
+					.find((item) => item.name === "worktree")!
+					.handler("remove task --preserve", ctx);
+			assert.equal(f.calls[0], "preserve");
+		}
+	});
+	it("does not register cleanup tools or the worktree command in children", () => {
+		process.env.PI_SUBAGENT_ID = "child";
+		try {
+			const { api, registeredTools, registeredCommands } =
+				createMockExtensionApi();
+			subagentsModule.default(api);
+			assert.equal(
+				registeredTools.some((tool) =>
+					["worktree_list", "worktree_remove"].includes(tool.name),
+				),
+				false,
+			);
+			assert.equal(
+				registeredCommands.some((command) => command.name === "worktree"),
+				false,
+			);
+		} finally {
+			delete process.env.PI_SUBAGENT_ID;
+		}
 	});
 });
 
@@ -7312,9 +7397,11 @@ describe("subagent interruption", () => {
 		assert.match(presentation, /Untracked: notes\.txt/);
 		assert.match(
 			presentation,
-			/After review and preservation, remove the workspace with:/,
+			/After review and preservation, explicitly remove/,
 		);
 		assert.match(presentation, /herdr worktree remove --workspace w9/);
+		assert.match(presentation, /\/worktree remove w9/);
+		assert.match(presentation, /worktree_remove/);
 		assert.equal(testApi.shouldRetainSubagentSurface({ worktree }), true);
 		assert.equal(testApi.shouldRetainSubagentSurface({}), false);
 	});

@@ -416,6 +416,14 @@ export function parseHerdrWorktreeList(output: string): HerdrWorktreeInfo[] {
 	});
 }
 
+export function buildWorktreeRemoveArgs(workspaceId: string): string[] {
+	return ["worktree", "remove", "--workspace", workspaceId];
+}
+
+export function removeHerdrWorktree(workspaceId: string): void {
+	herdrExec(buildWorktreeRemoveArgs(workspaceId));
+}
+
 export function listHerdrWorktrees(cwd?: string): HerdrWorktreeInfo[] {
 	const args = ["worktree", "list"];
 	if (cwd) args.push("--cwd", cwd);
@@ -950,6 +958,7 @@ export const __herdrTest__ = {
 	buildTabCreateArgs,
 	buildPaneSplitArgs,
 	buildWorktreeCreateArgs,
+	buildWorktreeRemoveArgs,
 	parseHerdrJson,
 	extractHerdrPaneId,
 	extractHerdrRootPaneId,

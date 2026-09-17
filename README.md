@@ -119,7 +119,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 
 ### Extensions
 
-**Subagents** — 6 main-session tools + 6 commands, plus 2 child-only tools:
+**Subagents** — 8 main-session tools + 6 commands, plus 2 child-only tools:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
@@ -128,6 +128,8 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | `subagent_send`      | Deliver a follow-up task to an idle persistent specialist                                   |
 | `subagent_stop`      | Gracefully stop a persistent specialist after its active task settles                      |
 | `subagents_list`     | List available agent definitions                                                            |
+| `worktree_list` | Parent-only inspect-only inventory of managed worktrees and cleanup blockers |
+| `worktree_remove` | Parent-only explicit removal by `target` path, branch, or workspace ID; optional `preserve: true` commits dirty state first |
 | `subagent_resume`    | Resume a previous Pi-backed sub-agent session in a new ordinary pane (async)                          |
 
 | Pi child-only tool | Description |
@@ -636,9 +638,17 @@ BTW shares the current working directory. It treats inherited work as reference 
 
 ## The `/worktree` Workflow
 
-`/worktree <worktree> [task]` creates a Herdr-managed worktree from the current committed branch and launches a new interactive Pi session there with the active conversation branch. The original session remains available. Use `/worktree list` to list worktrees for the current repository. This is a new-process handoff, not an in-place move of the existing shell or Pi process.
+`/worktree <worktree> [task]` creates a Herdr-managed worktree from the current committed branch and launches a new interactive Pi session there with the active conversation branch. The original session remains available. Use `/worktree list` or `worktree_list({})` to inspect managed worktrees, including cross-session orphans, whose canonical source repositories are inside the session's cwd subtree. This is a new-process handoff, not an in-place move of the existing shell or Pi process.
 
 ---
+
+### Explicit worktree cleanup
+
+Parent sessions can call `worktree_remove({ target: "<path|branch|workspace-id>", preserve: true })` or `/worktree remove <target> [--preserve]`. Preservation is optional and never implied: dirty work is blocked unless explicitly committed first or preserved as a WIP commit. The result reports its SHA. A failed preservation commit never proceeds to removal.
+
+Eligibility is rechecked at removal time: canonical source-repository cwd containment, registered linked checkout, no live child or persistent lease, and clean Git state with no untracked files or conflicts. Unknown inspection, identity disagreements, detached HEAD, locked checkouts, and initialized submodules block removal. Out-of-scope repositories are never eligible. Open workspaces use Herdr removal; orphans use Git removal and registration pruning after checkout absence is verified. Owned reachable manifests are marked `removed`; manifests from other sessions are not required or rewritten.
+
+Cleanup never deletes or rewrites branches, uses force flags, or runs automatically. Session start only reports retained-worktree counts. Child sessions receive neither cleanup tools nor the `/worktree` command. See [cleanup and recovery](docs/worktree-subagents.md#cleanup) for details.
 
 ## Custom Agents
 

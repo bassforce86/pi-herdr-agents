@@ -14,7 +14,7 @@ import { createLifecycle, type SubagentLifecycle } from "./lifecycle.ts";
 import type { ResolvedRuntimePlan } from "./runtime-routing.ts";
 import { createSubagentPaneFactory, loadPaneConfig } from "./pane-config.ts";
 import { HerdrWorktreeCreateError } from "./herdr.ts";
-import { isNonEmptyString, type JsonObject } from "./type-guards.ts";
+import { isNonEmptyString, isRecord, type JsonObject } from "./type-guards.ts";
 import {
 	createWorktreeSessionFork,
 	getNewEntries,
@@ -916,6 +916,22 @@ function resolveGitCommit(cwd: string, ref: string): string {
 	}).trim();
 }
 
+export function readWorktreeManifest(path: string): JsonObject | undefined {
+	try {
+		const value: unknown = JSON.parse(readFileSync(path, "utf8"));
+		if (
+			isRecord(value) &&
+			value.version === 1 &&
+			value.kind === "worktree-run" &&
+			value.owner === "pi-herdr-subagents"
+		)
+			return value;
+	} catch {
+		// Unreachable or malformed manifests do not establish ownership.
+	}
+	return undefined;
+}
+
 export function writeWorktreeManifest(path: string, value: JsonObject): void {
 	mkdirSync(dirname(path), { recursive: true });
 	let existing: JsonObject = {};
@@ -1017,7 +1033,7 @@ export function captureWorktreeHandoff(
 
 export function persistWorktreeResult(
 	worktree: WorktreeLaunch,
-	state: "running" | "ready_for_review" | "failed" | "needs_help",
+	state: "running" | "ready_for_review" | "failed" | "needs_help" | "removed",
 	handoff?: WorktreeHandoff,
 ): void {
 	writeWorktreeManifest(worktree.manifestFile, {

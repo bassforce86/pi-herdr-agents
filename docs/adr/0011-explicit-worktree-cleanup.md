@@ -15,9 +15,23 @@ removed after successful cleanup, but is not the authorization boundary.
 
 Discovery joins the managed filesystem root, Git registration and working-tree
 state, live Herdr workspace state, and current-session manifests. Unknown or
-conflicting evidence blocks removal. Live children and persistent leases block
-removal. Dirty work requires an explicit WIP preservation commit on the retained
-branch; conflicts, locks, and initialized submodules cannot be bypassed.
+conflicting evidence blocks removal. Machine-wide same-user process holders and
+persistent leases block removal; process names are not a runtime allowlist.
+Only Herdr-confirmed idle retained shell PIDs are exempt. Dirty work requires an
+explicit WIP preservation commit on the retained branch; detached HEAD,
+conflicts, locks, and initialized submodules cannot be bypassed.
+
+Paths are canonicalized, so symlinked ancestors are supported while checkout
+symlinks escaping the managed root are blocked. Ignored files are counted and
+disclosed, but do not block removal and are not captured by preservation. A
+failed preservation commit restores the original index. A created preservation
+SHA remains in the report even when subsequent removal fails.
+
+Removed manifests are no-op evidence only and never classify a recreated
+checkout. Post-removal manifest-write failures are warnings, not removal
+failures. Cleanup Git and Herdr calls have bounded 30-second timeouts. Child
+sessions retain their existing `/worktree list` and `/worktree <name>` surfaces;
+only the cleanup tools and removal subcommand are parent-only.
 
 Open workspaces are removed through Herdr. Git-only orphans use Git removal,
 verify checkout absence, and then prune stale registrations. Branches and their

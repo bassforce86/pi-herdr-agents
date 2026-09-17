@@ -5534,7 +5534,7 @@ describe("worktree cleanup public surface", () => {
 			assert.equal(f.calls[0], "preserve");
 		}
 	});
-	it("does not register cleanup tools or the worktree command in children", () => {
+	it("keeps the child worktree command but rejects removal and hides cleanup tools", async () => {
 		process.env.PI_SUBAGENT_ID = "child";
 		try {
 			const { api, registeredTools, registeredCommands } =
@@ -5546,10 +5546,21 @@ describe("worktree cleanup public surface", () => {
 				),
 				false,
 			);
-			assert.equal(
-				registeredCommands.some((command) => command.name === "worktree"),
-				false,
-			);
+			const command = registeredCommands.find(
+				(command) => command.name === "worktree",
+			)!;
+			assert.ok(command);
+			assert.doesNotMatch(command.description, /remove/);
+			const notices: string[] = [];
+			const ctx = {
+				cwd: "/repo",
+				ui: { notify: (text: string) => notices.push(text) },
+			};
+			await command.handler("", ctx);
+			assert.match(notices.at(-1)!, /<name>.*worktree list/);
+			assert.doesNotMatch(notices.at(-1)!, /remove/);
+			await command.handler("remove task --preserve", ctx);
+			assert.match(notices.at(-1)!, /parent-only/);
 		} finally {
 			delete process.env.PI_SUBAGENT_ID;
 		}

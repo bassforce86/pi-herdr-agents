@@ -111,8 +111,10 @@ be a descendant of the invoking session's canonical cwd.
 _Avoid_: Managed-path containment, manifest ownership authorization
 
 **Cleanup eligibility**:
-Fresh evidence of cwd containment, registered checkout identity, no live child or
-persistent lease, and clean Git state. Unknown evidence blocks removal.
+Fresh evidence of cwd containment, registered checkout identity, a named branch,
+no machine-wide process holder or persistent lease, and clean Git state. Only
+Herdr-confirmed idle retained shells are exempt from process checks. Ignored
+files are disclosed, not blockers. Unknown evidence blocks removal.
 _Avoid_: Guessed idle, presumed clean
 
 **Explicit worktree removal**:
@@ -123,4 +125,5 @@ _Avoid_: Branch deletion, completion cleanup
 **Dirty-state preservation**:
 Explicit opt-in staging and WIP commitment of a worktree's uncommitted and
 untracked files on its retained branch before rechecking removal eligibility.
+Ignored files are not captured. Commit failure restores the original index.
 _Avoid_: Implicit commit, stash, discard

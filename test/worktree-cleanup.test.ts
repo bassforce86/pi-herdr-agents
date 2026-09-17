@@ -1,6 +1,17 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+	mkdirSync,
+	symlinkSync,
+	chmodSync,
+} from "node:fs";
+import childProcess, { spawn, execFileSync } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,6 +21,8 @@ import {
 import { __herdrTest__ } from "../pi-extension/subagents/herdr.ts";
 import {
 	cleanupBlockers,
+	createWorktreeCleanupOperations,
+	__worktreeCleanupTest__,
 	listContainedWorktrees,
 	removeContainedWorktree,
 	worktreeInventoryNotice,
@@ -27,12 +40,14 @@ export function cleanupFixture() {
 		locked: false,
 		dirtyFiles: 0,
 		untrackedFiles: 0,
+		ignoredFiles: 0,
 		conflicts: 0,
 		submodules: false,
 	};
 	let present = true;
 	const operations: WorktreeCleanupOperations = {
 		scan: () => (present ? ["/managed/repo/task"] : []),
+		managedRoot: () => "/managed",
 		realpath: (path) => path,
 		resolveSource: () => "/repo",
 		inspectGit: () => ({ ...state }),
@@ -71,6 +86,191 @@ export function cleanupFixture() {
 		input: { cwd: "/repo", operations, target: "task" },
 	};
 }
+
+describe("cleanup operating-system probes", () => {
+	it("bounds Git and Herdr cleanup exec calls and fails closed on timeout", async (t) => {
+		const ops = createWorktreeCleanupOperations({
+			manifestDir: "/unused",
+			liveHolders: () => [],
+		});
+		const calls: string[] = [];
+		const mocked = t.mock.method(
+			childProcess,
+			"execFileSync",
+			(
+				file: string,
+				_args: string[],
+				options: { timeout?: number; killSignal?: string },
+			) => {
+				assert.equal(options.timeout, 30_000);
+				assert.equal(options.killSignal, "SIGKILL");
+				calls.push(file);
+				throw new Error("ETIMEDOUT");
+			},
+		);
+		syncBuiltinESMExports();
+		try {
+			const f = cleanupFixture();
+			f.operations.inspectGit = ops.inspectGit;
+			const result = await removeContainedWorktree(f.input);
+			assert.equal(result.status, "blocked");
+			assert.match(result.message, /ETIMEDOUT/);
+			assert.deepEqual(f.calls, []);
+			assert.throws(() => ops.listHerdr("/repo"), /ETIMEDOUT/);
+			assert.throws(() => ops.removeWorkspace("fixture"), /ETIMEDOUT/);
+			assert.deepEqual(calls, ["git", "herdr", "herdr"]);
+		} finally {
+			mocked.mock.restore();
+			syncBuiltinESMExports();
+		}
+	});
+	it("detects a real node-MainThread process through /proc, not a runtime allowlist", {
+		skip: process.platform !== "linux",
+	}, async () => {
+		const dir = mkdtempSync(join(tmpdir(), "cleanup-proc-"));
+		const checkout = join(dir, "checkout");
+		const procRoot = join(dir, "proc");
+		mkdirSync(checkout);
+		mkdirSync(procRoot);
+		const child = spawn(
+			process.execPath,
+			[
+				"-e",
+				'process.title="node-MainThread"; console.log("ready"); setInterval(() => {}, 1000)',
+			],
+			{ cwd: checkout, stdio: ["ignore", "pipe", "pipe"] },
+		);
+		try {
+			await once(child.stdout!, "data");
+			symlinkSync(`/proc/${child.pid}`, join(procRoot, String(child.pid)));
+			assert.equal(
+				readFileSync(`/proc/${child.pid}/comm`, "utf8").trim(),
+				"node-MainThread",
+			);
+			for (const idleShellPids of [new Set<number>(), new Set([child.pid!])]) {
+				assert.match(
+					__worktreeCleanupTest__
+						.processHolders(checkout, idleShellPids, procRoot)
+						.join(),
+					/node-MainThread.*holds the checkout/,
+				);
+			}
+		} finally {
+			child.kill();
+			await once(child, "exit");
+			rmSync(dir, { recursive: true });
+		}
+	});
+	it("blocks non-runtime holders and unverifiable live process cwd", {
+		skip: process.platform !== "linux",
+	}, () => {
+		const dir = mkdtempSync(join(tmpdir(), "cleanup-proc-"));
+		try {
+			mkdirSync(join(dir, "123"));
+			writeFileSync(join(dir, "123", "comm"), "python3\n");
+			writeFileSync(join(dir, "123", "status"), "State:\tS (sleeping)\n");
+			symlinkSync(dir, join(dir, "123", "cwd"));
+			assert.match(
+				__worktreeCleanupTest__.processHolders(dir, new Set(), dir).join(),
+				/python3.*holds/,
+			);
+			rmSync(join(dir, "123", "cwd"));
+			assert.throws(
+				() => __worktreeCleanupTest__.processHolders(dir, new Set(), dir),
+				/inspection unavailable/,
+			);
+		} finally {
+			rmSync(dir, { recursive: true });
+		}
+	});
+	it("tolerates symlinked ancestors but blocks a checkout symlink escaping the managed root", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "cleanup-alias-"));
+		try {
+			const root = join(dir, "real", "managed");
+			const path = join(root, "repo", "task");
+			mkdirSync(path, { recursive: true });
+			symlinkSync(join(dir, "real"), join(dir, "home"));
+			const ops = createWorktreeCleanupOperations({
+				managedRoot: join(dir, "home", "managed"),
+				manifestDir: join(dir, "manifests"),
+				liveHolders: () => [],
+			});
+			ops.resolveSource = () => join(dir, "home");
+			ops.inspectGit = () => ({ ...cleanupFixture().state });
+			ops.listHerdr = () => [];
+			ops.holders = async () => [];
+			const [row] = await listContainedWorktrees({
+				cwd: join(dir, "home"),
+				operations: ops,
+			});
+			assert.equal(row.classification, "eligible");
+			assert.equal(row.path, path);
+			assert.equal(row.sourceRepo, join(dir, "real"));
+			symlinkSync(dir, join(root, "repo", "escape"));
+			const escaped = (
+				await listContainedWorktrees({ cwd: dir, operations: ops })
+			).find((entry) => entry.path.endsWith("escape"))!;
+			assert.equal(escaped.classification, "unknown");
+			assert.match(escaped.blockers.join(), /symlink to an unmanaged/);
+		} finally {
+			rmSync(dir, { recursive: true });
+		}
+	});
+	it("probes ignored files and detached HEAD, and restores the exact index after a failed hook", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "cleanup-git-"));
+		const git = (args: string[]) =>
+			execFileSync("git", args, {
+				cwd: dir,
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+		try {
+			git(["init", "-q", "-b", "task"]);
+			git(["config", "user.name", "Cleanup test"]);
+			git(["config", "user.email", "cleanup@example.invalid"]);
+			git(["config", "commit.gpgsign", "false"]);
+			writeFileSync(join(dir, ".gitignore"), ".env\n");
+			writeFileSync(join(dir, "tracked"), "base\n");
+			git(["add", "."]);
+			git(["commit", "-qm", "base"]);
+			writeFileSync(join(dir, "tracked"), "staged\n");
+			git(["add", "tracked"]);
+			writeFileSync(join(dir, "tracked"), "unstaged\n");
+			writeFileSync(join(dir, "new-file"), "untracked\n");
+			writeFileSync(join(dir, ".env"), "ignored fixture\n");
+			const ops = createWorktreeCleanupOperations({
+				manifestDir: join(dir, "manifests"),
+				liveHolders: () => [],
+			});
+			assert.equal(ops.inspectGit(dir, dir).ignoredFiles, 1);
+			const index = readFileSync(join(dir, ".git", "index"));
+			const status = git(["status", "--porcelain=v1"]);
+			const hook = join(dir, ".git", "hooks", "pre-commit");
+			writeFileSync(hook, "#!/bin/sh\nexit 1\n");
+			chmodSync(hook, 0o755);
+			const entry = (await listContainedWorktrees(cleanupFixture().input))[0];
+			entry.path = dir;
+			assert.throws(() => ops.preserve(entry));
+			assert.deepEqual(readFileSync(join(dir, ".git", "index")), index);
+			assert.equal(git(["status", "--porcelain=v1"]), status);
+			assert.equal(readFileSync(join(dir, "tracked"), "utf8"), "unstaged\n");
+			assert.equal(readFileSync(join(dir, "new-file"), "utf8"), "untracked\n");
+			git([
+				"update-ref",
+				"--no-deref",
+				"HEAD",
+				git(["rev-parse", "HEAD"]).trim(),
+			]);
+			entry.git = ops.inspectGit(dir, dir);
+			assert.equal(entry.git.branch, "");
+			assert.match(cleanupBlockers(entry).join(), /Detached HEAD/);
+			entry.branch = entry.git.branch;
+			assert.throws(() => ops.preserve(entry), /Retained branch/);
+		} finally {
+			rmSync(dir, { recursive: true });
+		}
+	});
+});
 
 describe("explicit worktree cleanup", () => {
 	it("lists contained cross-session orphans and retains local-only history", async () => {
@@ -217,7 +417,11 @@ describe("explicit worktree cleanup", () => {
 		});
 	}
 	it("preserve never bypasses conflicts or submodule blockers", async () => {
-		for (const patch of [{ conflicts: 1 }, { submodules: true }]) {
+		for (const patch of [
+			{ conflicts: 1 },
+			{ submodules: true },
+			{ branch: "" },
+		]) {
 			const f = cleanupFixture();
 			Object.assign(f.state, { dirtyFiles: 1 }, patch);
 			assert.equal(
@@ -357,6 +561,95 @@ describe("explicit worktree cleanup", () => {
 		f.operations.scan = () => ["/managed/repo/task", "/managed/other/task"];
 		assert.match((await removeContainedWorktree(f.input)).message, /Ambiguous/);
 		assert.deepEqual(f.calls, []);
+	});
+	it("ignores removed manifests when the branch is relaunched at the same path", async () => {
+		const f = cleanupFixture();
+		f.operations.readManifests = () => [
+			{
+				file: "/old.json",
+				value: {
+					path: "/managed/repo/task",
+					branch: "previous",
+					workspaceId: "old",
+					state: "removed",
+				},
+			},
+		];
+		assert.equal(
+			(await listContainedWorktrees(f.input))[0].classification,
+			"eligible",
+		);
+		assert.equal((await removeContainedWorktree(f.input)).status, "removed");
+		assert.deepEqual(f.calls, ["git:/repo:/managed/repo/task", "prune:/repo"]);
+	});
+	it("discloses ignored files in inventory and removal without blocking", async () => {
+		const f = cleanupFixture();
+		f.state.ignoredFiles = 2;
+		const rows = await listContainedWorktrees(f.input);
+		assert.equal(rows[0].classification, "eligible");
+		assert.match(formatWorktreeInventory(rows), /2 ignored/);
+		assert.match(
+			(await removeContainedWorktree(f.input)).message,
+			/Deleted 2 ignored files/,
+		);
+	});
+	it("reports ignored exclusions and preservation SHA after later refusal or failure", async () => {
+		for (const kind of ["preserve", "reinspect", "remove"]) {
+			const f = cleanupFixture();
+			f.state.dirtyFiles = 1;
+			f.state.ignoredFiles = 2;
+			if (kind === "preserve")
+				f.operations.preserve = () => {
+					throw new Error("hook rejected");
+				};
+			if (kind === "reinspect") {
+				const preserve = f.operations.preserve;
+				f.operations.preserve = (entry) => {
+					const sha = preserve(entry);
+					f.state.locked = true;
+					return sha;
+				};
+			}
+			if (kind === "remove")
+				f.operations.removeCheckout = () => {
+					throw new Error("remove refused");
+				};
+			const result = await removeContainedWorktree({
+				...f.input,
+				preserve: true,
+			});
+			assert.notEqual(result.status, "removed");
+			assert.match(
+				result.message,
+				/2 ignored files are not captured by preservation/,
+			);
+			if (kind !== "preserve") assert.match(result.message, /wip-sha/);
+		}
+	});
+	it("reports manifest write failure as removed with warning", async () => {
+		const f = cleanupFixture();
+		f.operations.readManifests = () => [
+			{
+				file: "/manifest",
+				value: { path: "/managed/repo/task", branch: "task" },
+			},
+		];
+		f.operations.writeManifest = () => {
+			throw new Error("permission denied");
+		};
+		const result = await removeContainedWorktree(f.input);
+		assert.equal(result.status, "removed");
+		assert.match(result.message, /Warning: Manifest.*permission denied/);
+	});
+	it("reports inspection failure instead of claiming an existing branch is missing", async () => {
+		const f = cleanupFixture();
+		f.operations.inspectGit = () => {
+			throw new Error("Git timed out");
+		};
+		const result = await removeContainedWorktree(f.input);
+		assert.equal(result.status, "blocked");
+		assert.match(result.message, /Git timed out/);
+		assert.doesNotMatch(result.message, /Target not found/);
 	});
 	it("already removed is a no-op with retained manifest evidence", async () => {
 		const f = cleanupFixture();

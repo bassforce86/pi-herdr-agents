@@ -1,7 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { lstatSync, readdirSync, realpathSync, readFileSync } from "node:fs";
+import {
+	lstatSync,
+	readdirSync,
+	realpathSync,
+	readFileSync,
+	writeFileSync,
+	unlinkSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import {
 	getHerdrPaneProcessInfo,
 	listHerdrPanes,
@@ -19,6 +26,7 @@ export interface CleanupGitState {
 	locked: boolean;
 	dirtyFiles: number;
 	untrackedFiles: number;
+	ignoredFiles: number;
 	conflicts: number;
 	submodules: boolean;
 }
@@ -42,6 +50,7 @@ export interface WorktreeInventoryEntry {
 /** All probes and effects are injectable; inventories never perform mutations. */
 export interface WorktreeCleanupOperations {
 	scan(): string[];
+	managedRoot(): string;
 	realpath(path: string): string;
 	resolveSource(path: string): string;
 	inspectGit(path: string, sourceRepo: string): CleanupGitState;
@@ -115,15 +124,19 @@ async function inspectEntry(
 	};
 	try {
 		const canonicalPath = ops.realpath(path);
-		if (canonicalPath !== resolve(path))
+		if (!contained(ops.managedRoot(), canonicalPath))
 			throw new Error(
-				"Managed checkout path is a symlink alias; inspect residue manually",
+				"Managed checkout is a symlink to an unmanaged location; inspect residue manually",
 			);
 		entry.path = canonicalPath;
 		entry.sourceRepo = ops.realpath(ops.resolveSource(entry.path));
 		entry.contained = contained(ops.realpath(cwd), entry.sourceRepo);
 		entry.manifest = manifests.filter(
-			({ value }) => isString(value.path) && resolve(value.path) === entry.path,
+			({ value }) =>
+				value.state !== "removed" &&
+				isString(value.path) &&
+				ops.exists(value.path) &&
+				ops.realpath(value.path) === entry.path,
 		);
 		entry.git = ops.inspectGit(entry.path, entry.sourceRepo);
 		entry.branch = entry.git.branch;
@@ -146,7 +159,6 @@ async function inspectEntry(
 		for (const { value } of entry.manifest) {
 			if (
 				value.branch !== entry.branch ||
-				value.state === "removed" ||
 				(isString(value.sourceCwd) &&
 					ops.realpath(ops.resolveSource(value.sourceCwd)) !==
 						entry.sourceRepo) ||
@@ -187,7 +199,7 @@ export function formatWorktreeInventory(
 		rows
 			.map(
 				(row) =>
-					`${row.branch ?? "unknown branch"} — ${row.path}\nSource: ${row.sourceRepo ?? "unknown"} · workspace: ${row.workspaceId ?? "none"} · manifest: ${row.manifest.length ? row.manifest.map(({ value }) => value.state ?? "unknown").join(", ") : "absent"}\n${row.classification} · Git: ${row.git ? `${row.git.dirtyFiles} dirty, ${row.git.untrackedFiles} untracked, ${row.git.conflicts} conflicts` : "unknown"}${row.blockers.length ? ` · ${row.blockers.join("; ")}` : " · clean"}`,
+					`${row.branch ?? "unknown branch"} — ${row.path}\nSource: ${row.sourceRepo ?? "unknown"} · workspace: ${row.workspaceId ?? "none"} · manifest: ${row.manifest.length ? row.manifest.map(({ value }) => value.state ?? "unknown").join(", ") : "absent"}\n${row.classification} · Git: ${row.git ? `${row.git.dirtyFiles} dirty, ${row.git.untrackedFiles} untracked, ${row.git.ignoredFiles} ignored, ${row.git.conflicts} conflicts` : "unknown"}${row.blockers.length ? ` · ${row.blockers.join("; ")}` : " · clean"}`,
 			)
 			.join("\n\n") || "No managed worktrees found."
 	);
@@ -210,11 +222,27 @@ export async function removeContainedWorktree(
 	const { operations: ops } = input;
 	let entry: WorktreeInventoryEntry | undefined;
 	let preservationSha: string | undefined;
+	let ignoredFiles = 0;
+	let preservationAttempted = false;
+	let checkoutRemoved = false;
+	const ignoredNotice = () =>
+		ignoredFiles
+			? checkoutRemoved
+				? ` Deleted ${ignoredFiles} ignored files.${preservationAttempted ? " Ignored files are not captured by preservation." : ""}`
+				: ` ${ignoredFiles} ignored files${preservationAttempted ? " are not captured by preservation" : " present"}.`
+			: "";
 	try {
 		const rows = await listContainedWorktrees(input);
+		const targetPath =
+			!rows.some((row) => row.path === input.target) &&
+			isAbsolute(input.target) &&
+			ops.exists(input.target)
+				? ops.realpath(input.target)
+				: input.target;
 		const matches = rows.filter(
 			(row) =>
 				row.path === input.target ||
+				row.path === targetPath ||
 				row.branch === input.target ||
 				row.workspaceId === input.target,
 		);
@@ -242,7 +270,12 @@ export async function removeContainedWorktree(
 				status: "blocked",
 				message: matches.length
 					? "Ambiguous target; use the exact worktree path."
-					: "Target not found in managed inventory; nothing removed.",
+					: rows.some((row) => row.classification === "unknown")
+						? `Target could not be resolved because inventory inspection failed: ${rows
+								.filter((row) => row.classification === "unknown")
+								.map((row) => `${row.path}: ${row.blockers.join("; ")}`)
+								.join("; ")}`
+						: "Target not found in managed inventory; nothing removed.",
 			};
 		}
 		// Never trust an inventory cached by the caller, or even the discovery pass.
@@ -252,6 +285,7 @@ export async function removeContainedWorktree(
 			ops,
 			ops.readManifests(),
 		);
+		ignoredFiles = entry.git?.ignoredFiles ?? 0;
 		const hardBlockers = entry.blockers.filter(
 			(blocker) => !blocker.startsWith("Dirty worktree:"),
 		);
@@ -260,8 +294,13 @@ export async function removeContainedWorktree(
 			hardBlockers.length ||
 			(entry.blockers.length && !input.preserve)
 		)
-			return { status: "blocked", entry, message: entry.blockers.join("; ") };
+			return {
+				status: "blocked",
+				entry,
+				message: entry.blockers.join("; ") + ignoredNotice(),
+			};
 		if (entry.git && (entry.git.dirtyFiles || entry.git.untrackedFiles)) {
+			preservationAttempted = true;
 			preservationSha = ops.preserve(entry);
 			const before = entry;
 			entry = await inspectEntry(
@@ -281,41 +320,55 @@ export async function removeContainedWorktree(
 					status: "blocked",
 					entry,
 					preservationSha,
-					message: `Preserved ${preservationSha}, but reinspection blocks removal: ${entry.blockers.join("; ") || "identity changed"}`,
+					message: `Preserved ${preservationSha}, but reinspection blocks removal: ${entry.blockers.join("; ") || "identity changed"}${ignoredNotice()}`,
 				};
 		}
+		ignoredFiles = entry.git?.ignoredFiles ?? ignoredFiles;
 		if (!entry.sourceRepo) throw new Error("Source repository unknown");
 		if (entry.workspaceId) ops.removeWorkspace(entry.workspaceId);
 		else ops.removeCheckout(entry.sourceRepo, entry.path);
 		if (ops.exists(entry.path))
 			throw new Error("Removal left the checkout present");
+		checkoutRemoved = true;
 		if (!entry.workspaceId) ops.prune(entry.sourceRepo);
-		for (const manifest of entry.manifest)
-			ops.writeManifest(manifest.file, {
-				state: "removed",
-				workspaceRemovedAt: Date.now(),
-			});
+		const warnings: string[] = [];
+		for (const manifest of entry.manifest) {
+			try {
+				ops.writeManifest(manifest.file, {
+					state: "removed",
+					workspaceRemovedAt: Date.now(),
+				});
+			} catch (error) {
+				warnings.push(
+					`Manifest ${manifest.file} update failed: ${message(error)}`,
+				);
+			}
+		}
 		return {
 			status: "removed",
 			entry,
 			preservationSha,
-			message: `Removed ${entry.path}. Branch ${entry.branch} and its commits retained.${preservationSha ? ` Preservation commit: ${preservationSha}.` : ""}${entry.manifest.length ? " Manifest marked removed." : " No reachable manifest (orphan)."}`,
+			message: `Removed ${entry.path}. Branch ${entry.branch} and its commits retained.${preservationSha ? ` Preservation commit: ${preservationSha}.` : ""}${ignoredNotice()}${warnings.length ? ` Warning: ${warnings.join("; ")}` : entry.manifest.length ? " Manifest marked removed." : " No reachable manifest (orphan)."}`,
 		};
 	} catch (error) {
 		return {
 			status: "failed",
 			entry,
 			preservationSha,
-			message: `Removal failed: ${message(error)}${preservationSha ? `; preserved commit ${preservationSha}` : ""}`,
+			message: `Removal failed: ${message(error)}${preservationSha ? `; preserved commit ${preservationSha}` : ""}${ignoredNotice()}`,
 		};
 	}
 }
+
+const CLEANUP_TIMEOUT_MS = 30_000;
 
 function git(cwd: string, args: string[]): string {
 	return execFileSync("git", args, {
 		cwd,
 		encoding: "utf8",
 		stdio: ["ignore", "pipe", "pipe"],
+		timeout: CLEANUP_TIMEOUT_MS,
+		killSignal: "SIGKILL",
 	});
 }
 function exists(path: string): boolean {
@@ -363,10 +416,21 @@ function inspectGit(path: string, sourceRepo: string): CleanupGitState {
 	const records = git(sourceRepo, ["worktree", "list", "--porcelain", "-z"])
 		.split("\0\0")
 		.map((record) => record.split("\0"));
-	const record = records.find((fields) => fields[0] === `worktree ${path}`);
-	const branch = git(path, ["symbolic-ref", "-q", "HEAD"])
-		.trim()
-		.replace(/^refs\/heads\//, "");
+	const record = records.find((fields) => {
+		if (!fields[0]?.startsWith("worktree ")) return false;
+		const registeredPath = fields[0].slice("worktree ".length);
+		return exists(registeredPath) && realpathSync(registeredPath) === path;
+	});
+	// rev-parse returns HEAD for a detached checkout, without treating a valid
+	// detached state as an inspection error. Only named refs may be preserved.
+	const headRef = git(path, [
+		"rev-parse",
+		"--symbolic-full-name",
+		"HEAD",
+	]).trim();
+	const branch = headRef.startsWith("refs/heads/")
+		? headRef.slice("refs/heads/".length)
+		: "";
 	const status = git(path, [
 		"status",
 		"--porcelain=v1",
@@ -386,7 +450,9 @@ function inspectGit(path: string, sourceRepo: string): CleanupGitState {
 		registered:
 			!!record &&
 			path !== sourceRepo &&
-			record.includes(`branch refs/heads/${branch}`),
+			(branch
+				? record.includes(`branch refs/heads/${branch}`)
+				: record.includes("detached")),
 		locked: !!record?.some(
 			(field) => field === "locked" || field.startsWith("locked "),
 		),
@@ -394,6 +460,15 @@ function inspectGit(path: string, sourceRepo: string): CleanupGitState {
 		untrackedFiles: git(path, [
 			"ls-files",
 			"--others",
+			"--exclude-standard",
+			"-z",
+		])
+			.split("\0")
+			.filter(Boolean).length,
+		ignoredFiles: git(path, [
+			"ls-files",
+			"--others",
+			"--ignored",
 			"--exclude-standard",
 			"-z",
 		])
@@ -409,36 +484,50 @@ function inspectGit(path: string, sourceRepo: string): CleanupGitState {
 }
 
 /** Detect background processes as well as Herdr's foreground agent. Unknown access blocks. */
-function processHolders(path: string): string[] {
+function processHolders(
+	path: string,
+	idleShellPids = new Set<number>(),
+	procRoot = "/proc",
+): string[] {
 	const blockers: string[] = [];
+	const shellNames = new Set(["bash", "zsh", "fish", "sh", "dash"]);
+	if (!process.getuid) throw new Error("Process user identity unavailable");
 	if (process.platform === "linux") {
-		for (const pid of readdirSync("/proc").filter((name) =>
+		for (const pid of readdirSync(procRoot).filter((name) =>
 			/^\d+$/.test(name),
 		)) {
 			try {
-				if (lstatSync(`/proc/${pid}`).uid !== process.getuid?.()) continue;
-				const command = readFileSync(`/proc/${pid}/comm`, "utf8").trim();
-				// Pi is a Node process (or a named Pi/Bun runtime). Unrelated protected
-				// daemons such as gpg-agent do not establish a child or specialist lease.
-				if (!["pi", "node", "bun", "deno", "MainThread"].includes(command))
+				if (lstatSync(`${procRoot}/${pid}`).uid !== process.getuid?.())
 					continue;
-				const cwd = realpathSync(`/proc/${pid}/cwd`);
+				const command = readFileSync(`${procRoot}/${pid}/comm`, "utf8").trim();
+				// A shell can exec a runtime without changing PID/process group.
+				if (idleShellPids.has(Number(pid)) && shellNames.has(command)) continue;
+				const cwd = realpathSync(`${procRoot}/${pid}/cwd`);
 				if (contained(path, cwd))
-					blockers.push(
-						`Live Pi runtime process ${pid} (${command}) holds the checkout`,
-					);
+					blockers.push(`Live process ${pid} (${command}) holds the checkout`);
 			} catch (error) {
 				// SAFETY: these filesystem calls throw Node errors with an optional errno code.
 				if (
 					["ENOENT", "ESRCH"].includes(
 						(error as NodeJS.ErrnoException).code ?? "",
 					)
-				)
-					continue;
-				throw error;
+				) {
+					if (!exists(`${procRoot}/${pid}`)) continue;
+					// A zombie has no cwd and cannot hold a checkout. Missing cwd for
+					// a process that is still alive is not evidence of absence.
+					if (
+						/^State:\s+[ZX]/m.test(
+							readFileSync(`${procRoot}/${pid}/status`, "utf8"),
+						)
+					)
+						continue;
+				}
+				throw new Error(
+					`Process ${pid} inspection unavailable: ${message(error)}`,
+				);
 			}
 		}
-	} else {
+	} else if (process.platform === "darwin") {
 		// lsof supplies cwd and command records on macOS; failure is not evidence of absence.
 		const output = execFileSync(
 			"lsof",
@@ -452,7 +541,7 @@ function processHolders(path: string): string[] {
 				"cwd",
 				"-Fpcn",
 			],
-			{ encoding: "utf8" },
+			{ encoding: "utf8", timeout: CLEANUP_TIMEOUT_MS, killSignal: "SIGKILL" },
 		);
 		let pid = "";
 		let command = "";
@@ -461,29 +550,37 @@ function processHolders(path: string): string[] {
 			if (line.startsWith("c")) command = line.slice(1);
 			if (
 				line.startsWith("n") &&
-				contained(path, line.slice(1)) &&
-				!["bash", "zsh", "fish", "sh", "dash"].includes(command)
+				!(idleShellPids.has(Number(pid)) && shellNames.has(command)) &&
+				contained(path, realpathSync(line.slice(1)))
 			)
 				blockers.push(`Live process ${pid} (${command}) holds the checkout`);
 		}
+	} else {
+		throw new Error(`Process inspection unsupported on ${process.platform}`);
 	}
 	return blockers;
 }
+
+export const __worktreeCleanupTest__ = { processHolders };
 
 export function createWorktreeCleanupOperations(input: {
 	manifestDir: string;
 	liveHolders: () => { path: string; persistent?: boolean }[];
 	managedRoot?: string;
 }): WorktreeCleanupOperations {
+	const root = input.managedRoot ?? join(homedir(), ".herdr", "worktrees");
+	let canonicalRoot: string;
 	return {
-		scan: () =>
-			directories(
-				input.managedRoot ?? join(homedir(), ".herdr", "worktrees"),
-			).flatMap(directories),
+		managedRoot: () => canonicalRoot ?? realpathSync(root),
+		scan: () => {
+			if (!exists(root)) return [];
+			canonicalRoot = realpathSync(root);
+			return directories(canonicalRoot).flatMap(directories);
+		},
 		realpath: realpathSync,
 		resolveSource,
 		inspectGit,
-		listHerdr: listHerdrWorktrees,
+		listHerdr: (source) => listHerdrWorktrees(source, CLEANUP_TIMEOUT_MS),
 		readManifests: () => {
 			if (!exists(input.manifestDir)) return [];
 			return readdirSync(input.manifestDir)
@@ -503,9 +600,9 @@ export function createWorktreeCleanupOperations(input: {
 						? "Persistent-specialist lease holds the worktree"
 						: "Live child holds the worktree",
 				);
-			blockers.push(...processHolders(entry.path));
+			const idleShellPids = new Set<number>();
 			if (entry.workspaceId) {
-				const panes = await listHerdrPanes();
+				const panes = await listHerdrPanes(CLEANUP_TIMEOUT_MS);
 				if (!panes) throw new Error("Herdr pane snapshot unavailable");
 				const owned = panes.filter(
 					(pane) => pane.workspaceId === entry.workspaceId,
@@ -513,15 +610,20 @@ export function createWorktreeCleanupOperations(input: {
 				if (!owned.length)
 					throw new Error("Open workspace has no observable panes");
 				for (const pane of owned) {
-					const info = getHerdrPaneProcessInfo(pane.paneId);
+					const info = getHerdrPaneProcessInfo(pane.paneId, CLEANUP_TIMEOUT_MS);
 					if (!info.shellPid || !info.foregroundProcessGroupId)
 						throw new Error(`Process state unknown for pane ${pane.paneId}`);
-					if (info.foregroundProcessGroupId !== info.shellPid)
+					// Exempt only Herdr's observed idle retained shell, never a runtime
+					// name or a shell running a foreground command.
+					if (info.foregroundProcessGroupId === info.shellPid)
+						idleShellPids.add(info.shellPid);
+					else
 						blockers.push(
 							`Live child or foreground process in pane ${pane.paneId}`,
 						);
 				}
 			}
+			blockers.push(...processHolders(entry.path, idleShellPids));
 			return blockers;
 		},
 		exists,
@@ -532,15 +634,28 @@ export function createWorktreeCleanupOperations(input: {
 					entry.branch
 			)
 				throw new Error("Retained branch changed before preservation");
-			git(entry.path, ["add", "-A"]);
-			git(entry.path, [
-				"commit",
-				"-m",
-				"WIP: preserve worktree before explicit cleanup",
-			]);
+			const index = git(entry.path, [
+				"rev-parse",
+				"--path-format=absolute",
+				"--git-path",
+				"index",
+			]).trim();
+			const originalIndex = exists(index) ? readFileSync(index) : undefined;
+			try {
+				git(entry.path, ["add", "-A"]);
+				git(entry.path, [
+					"commit",
+					"-m",
+					"WIP: preserve worktree before explicit cleanup",
+				]);
+			} catch (error) {
+				if (originalIndex) writeFileSync(index, originalIndex);
+				else if (exists(index)) unlinkSync(index);
+				throw error;
+			}
 			return git(entry.path, ["rev-parse", "HEAD"]).trim();
 		},
-		removeWorkspace: removeHerdrWorktree,
+		removeWorkspace: (id) => removeHerdrWorktree(id, CLEANUP_TIMEOUT_MS),
 		removeCheckout: (source, path) => {
 			git(source, ["worktree", "remove", "--", path]);
 		},

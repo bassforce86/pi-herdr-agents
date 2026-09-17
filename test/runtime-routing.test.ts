@@ -149,6 +149,72 @@ describe("runtime routing", () => {
 		);
 	});
 
+	it("expands whole-value task references using authenticated configured order", () => {
+		const entries = [
+			model("fake", "parent"),
+			model("other", "worker"),
+			model("other", "backup"),
+			model("other", "unauthed"),
+		];
+		const tasks = {
+			coding: ["other/worker", "other/unauthed", "other/backup"],
+		};
+		assert.deepEqual(
+			resolveRuntimePlans(
+				{ model: " task:CoDiNg " },
+				{},
+				parent,
+				registry(entries),
+				tasks,
+			).map((plan) => plan.model),
+			["other/worker", "other/backup"],
+		);
+		assert.deepEqual(
+			resolveRuntimePlans(
+				{ model: "task:coding" },
+				{},
+				parent,
+				registry(entries),
+				tasks,
+				true,
+			).map((plan) => plan.model),
+			["other/worker"],
+		);
+		assert.throws(
+			() =>
+				resolveRuntimePlans(
+					{ model: "task:coding, other/backup" },
+					{},
+					parent,
+					registry(entries),
+					tasks,
+				),
+			/must be the entire model value/,
+		);
+		assert.throws(
+			() =>
+				resolveRuntimePlans(
+					{ model: "task:qa" },
+					{},
+					parent,
+					registry(entries),
+					tasks,
+				),
+			/configured categories: coding/,
+		);
+		assert.throws(
+			() =>
+				resolveRuntimePlans(
+					{},
+					{ model: "task:coding" },
+					parent,
+					registry(entries),
+					tasks,
+				),
+			/only valid in the subagent tool's model parameter/,
+		);
+	});
+
 	it("keeps the selected source when agent defaults provide fallbacks", () => {
 		const plans = resolveRuntimePlans(
 			{},

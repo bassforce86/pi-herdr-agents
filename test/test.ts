@@ -12,7 +12,11 @@ import {
 	rmSync,
 	utimesSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import {
+	getSubagentsConfigPath,
+	getSubagentsConfigExamplePath,
+} from "../pi-extension/subagents/config-path.ts";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import childProcess, { execFileSync } from "node:child_process";
@@ -70,6 +74,7 @@ import {
 	loadModelConfig,
 	parseModelConfig,
 	resolveModelDefault,
+	writeTaskModelConfig,
 } from "../pi-extension/subagents/model-config.ts";
 import {
 	loadRoleConfig,
@@ -1913,6 +1918,59 @@ describe("status.ts", () => {
 	});
 });
 
+describe("shared subagent configuration path", () => {
+	it("resolves the user config under PI_CODING_AGENT_DIR and keeps the packaged example separate", () => {
+		const previous = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = "/tmp/custom-pi-agent";
+		try {
+			assert.equal(
+				getSubagentsConfigPath(),
+				"/tmp/custom-pi-agent/herdr-agents/config.json",
+			);
+			assert.match(getSubagentsConfigExamplePath(), /config\.json\.example$/);
+		} finally {
+			restoreEnvVar("PI_CODING_AGENT_DIR", previous);
+		}
+	});
+
+	it("keeps the packaged example strict JSON without task preferences", () => {
+		const example = JSON.parse(
+			readFileSync(getSubagentsConfigExamplePath(), "utf8"),
+		);
+		assert.equal(example.models.tasks, undefined);
+	});
+
+	it("routes every config reader through the user config path", () => {
+		withTempDir((dir) => {
+			const previous = process.env.PI_CODING_AGENT_DIR;
+			process.env.PI_CODING_AGENT_DIR = dir;
+			try {
+				const configPath = getSubagentsConfigPath();
+				mkdirSync(dirname(configPath), { recursive: true });
+				writeFileSync(
+					configPath,
+					JSON.stringify({
+						status: { enabled: false },
+						models: { default: "fake/default" },
+						roles: { bundled: false },
+						panes: { mode: "tab" },
+						supervision: { forcePolling: true },
+						persistent: { maxAgents: 2 },
+					}),
+				);
+				assert.equal(loadModelConfig().default, "fake/default");
+				assert.equal(loadRoleConfig().bundled, false);
+				assert.equal(loadPaneConfig().mode, "tab");
+				assert.equal(loadSupervisionConfig().forcePolling, true);
+				assert.equal(loadPersistentConfig().maxAgents, 2);
+				assert.equal(loadStatusConfig().enabled, false);
+			} finally {
+				restoreEnvVar("PI_CODING_AGENT_DIR", previous);
+			}
+		});
+	});
+});
+
 describe("pane configuration", () => {
 	it("defaults to four grouped panes when panes are absent", () => {
 		assert.deepEqual(parsePaneConfig({}), {
@@ -2097,6 +2155,98 @@ describe("model configuration", () => {
 			resolveModelDefault("__proto__", undefined, config),
 			"fake/proto",
 		);
+	});
+
+	it("parses strict task preferences and metadata", () => {
+		assert.deepEqual(
+			parseModelConfig({
+				models: {
+					tasks: { coding: ["fake/worker"] },
+					tasksMeta: {
+						generatedAt: "2026-09-17T00:00:00Z",
+						method: "research",
+					},
+				},
+			}),
+			{
+				agents: {},
+				tasks: { coding: ["fake/worker"] },
+				tasksMeta: {
+					generatedAt: "2026-09-17T00:00:00Z",
+					method: "research",
+				},
+			},
+		);
+		for (const config of [
+			{ models: { tasks: { debugging: ["fake/worker"] } } },
+			{ models: { tasks: { coding: [] } } },
+			{ models: { tasks: { coding: [1] } } },
+			{ models: { tasksMeta: { generatedAt: "nope", method: "guesswork" } } },
+		]) {
+			assert.throws(
+				() => parseModelConfig(config),
+				/models\.tasks|models\.tasksMeta/,
+			);
+		}
+		for (const config of [
+			{ models: { default: "task:coding" } },
+			{ models: { agents: { worker: "task:coding" } } },
+		]) {
+			assert.throws(
+				() => parseModelConfig(config),
+				/only valid in the subagent tool's model parameter/,
+			);
+		}
+		assert.deepEqual(parseModelConfig({ models: { tasks: {} } }), {
+			agents: {},
+		});
+	});
+
+	it("writes only validated task preferences into a seeded user config", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "herdr-agents", "config.json");
+			const examplePath = join(dir, "config.json.example");
+			writeFileSync(
+				examplePath,
+				JSON.stringify({
+					status: { enabled: true },
+					roles: { bundled: false },
+					models: { default: "fake/default" },
+				}),
+			);
+			writeTaskModelConfig(
+				configPath,
+				examplePath,
+				{ coding: ["fake/worker"] },
+				{ generatedAt: "2026-09-17T00:00:00Z", method: "research" },
+				(candidate) => candidate === "fake/worker",
+			);
+			assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), {
+				status: { enabled: true },
+				roles: { bundled: false },
+				models: {
+					default: "fake/default",
+					tasks: { coding: ["fake/worker"] },
+					tasksMeta: {
+						generatedAt: "2026-09-17T00:00:00Z",
+						method: "research",
+					},
+				},
+			});
+			const before = readFileSync(configPath, "utf8");
+			assert.throws(
+				() =>
+					writeTaskModelConfig(
+						configPath,
+						examplePath,
+						{ coding: ["missing/model"] },
+						{ generatedAt: "2026-09-17T00:00:00Z", method: "research" },
+						() => false,
+					),
+				/missing\/model/,
+			);
+			assert.equal(readFileSync(configPath, "utf8"), before);
+		});
 	});
 
 	it("rejects invalid model configuration", () => {
@@ -5406,6 +5556,23 @@ describe("commands", () => {
 				level: "warning",
 			},
 		]);
+	});
+
+	it("registers /subagents-init with registry research and reload guidance", async () => {
+		const { api, registeredCommands, sentUserMessages } =
+			createMockExtensionApi();
+		subagentsModule.default(api);
+		const init = registeredCommands.find(
+			(command) => command.name === "subagents-init",
+		);
+		assert.ok(init, "expected /subagents-init to be registered");
+		await init.handler("", {});
+		assert.equal(sentUserMessages.length, 1);
+		assert.match(sentUserMessages[0], /registry object/);
+		assert.match(sentUserMessages[0], /web search/);
+		assert.match(sentUserMessages[0], /registry-only/);
+		assert.match(sentUserMessages[0], /subagents_write_task_models/);
+		assert.match(sentUserMessages[0], /\/reload/);
 	});
 
 	it("registers direct BTW commands without steering the parent", async () => {

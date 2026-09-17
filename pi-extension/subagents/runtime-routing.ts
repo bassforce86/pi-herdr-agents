@@ -3,6 +3,7 @@ import {
 	getSupportedThinkingLevels,
 	type Model,
 } from "@earendil-works/pi-ai";
+import type { TaskPreferences } from "./model-config.ts";
 import { isFiniteNumber, isString } from "./type-guards.ts";
 
 export const THINKING_LEVELS = [
@@ -307,13 +308,58 @@ export function resolveRuntimePlans(
 	agentDefaults: RuntimeRequest,
 	parent: ParentRuntime,
 	registry: ModelRegistryAdapter,
+	taskPreferences?: TaskPreferences,
+	worktree = false,
 ): ResolvedRuntimePlan[] {
 	const selection = selectField(request.model, agentDefaults.model);
-	if (!selection.value) {
+	if (!selection.value)
 		return [resolveRuntimePlan(request, agentDefaults, parent, registry)];
+
+	let references: string[];
+	const trimmed = selection.value.trim();
+	if (trimmed.toLowerCase().startsWith("task:")) {
+		if (trimmed.includes(",")) {
+			throw new RuntimeResolutionError(
+				"task: references must be the entire model value, not part of a fallback list",
+			);
+		}
+		if (selection.source !== "request") {
+			throw new RuntimeResolutionError(
+				"task: references are only valid in the subagent tool's model parameter",
+			);
+		}
+		const category = trimmed.slice("task:".length).trim().toLowerCase();
+		const configuredCategories = Object.keys(taskPreferences ?? {});
+		if (
+			!category ||
+			!taskPreferences ||
+			!Object.hasOwn(taskPreferences, category)
+		) {
+			throw new RuntimeResolutionError(
+				`task category ${JSON.stringify(category)} is not configured; configured categories: ${configuredCategories.join(", ") || "(none)"}`,
+			);
+		}
+		// SAFETY: Object.hasOwn above confirms this lower-cased category is a configured key.
+		const candidates = taskPreferences[category as keyof TaskPreferences] ?? [];
+		references = candidates.filter((candidate) => {
+			const parsed = parseExactModelRef(candidate);
+			const model = parsed && registry.find(parsed.provider, parsed.modelId);
+			return !!model && registry.hasConfiguredAuth(model);
+		});
+		if (references.length === 0) {
+			const alternatives = registry
+				.available()
+				.map((model) => `${model.provider}/${model.id}`);
+			throw new RuntimeResolutionError(
+				`task category ${JSON.stringify(category)} has no authenticated candidates; authenticated alternatives: ${alternatives.join(", ") || "(none)"}`,
+			);
+		}
+		if (worktree) references = [references[0]];
+	} else {
+		references = parseModelFallbacks(selection.value);
 	}
 
-	return parseModelFallbacks(selection.value).map((model) =>
+	return references.map((model) =>
 		resolveRuntimePlan(
 			selection.source === "request"
 				? { ...request, model }
@@ -337,6 +383,7 @@ function formatTokenCount(value: number | undefined): string | undefined {
 export function buildAuthenticatedModelCatalog(
 	registry: ModelRegistryAdapter,
 	limit = 24,
+	taskPreferences?: TaskPreferences,
 ): string {
 	const models = registry
 		.available()
@@ -372,8 +419,36 @@ export function buildAuthenticatedModelCatalog(
 			`- … ${models.length - visibleModels.length} more authenticated models omitted`,
 		);
 	}
+	const configured = Object.entries(taskPreferences ?? {})
+		.map(
+			([category, candidates]) =>
+				[
+					category,
+					candidates.filter((candidate) => {
+						const parsed = parseExactModelRef(candidate);
+						const model =
+							parsed && registry.find(parsed.provider, parsed.modelId);
+						return !!model && registry.hasConfiguredAuth(model);
+					}),
+				] as const,
+		)
+		.filter(([, candidates]) => candidates.length > 0);
+	if (configured.length > 0) {
+		lines.push(
+			"Task-category shortlists (use task:<category> only as the entire model value):",
+		);
+		for (const [category, candidates] of configured)
+			lines.push(`- ${category}: ${candidates.join(", ")}`);
+		lines.push(
+			"For review spawns where an authoring model family is known, skip candidates sharing the authoring model's provider family and use an exact provider/model-id; the extension does not enforce this.",
+		);
+	} else {
+		lines.push(
+			"For orchestrated children, explicitly select an exact provider/model-id by task tier first (fast for bounded mechanical work and recon, mid for ordinary implementation or review, frontier for architecture, security, hard diagnosis, or adversarial review), then set supported thinking. Reviews must use a different provider/family than the producing model.",
+		);
+	}
 	lines.push(
-		"For orchestrated children, explicitly select an exact provider/model-id by task tier first (fast for bounded mechanical work and recon, mid for ordinary implementation or review, frontier for architecture, security, hard diagnosis, or adversarial review), then set supported thinking. Reviews must use a different provider/family than the producing model. Omitting model and thinking inherits the parent runtime as a discouraged fallback.",
+		"Omitting model and thinking inherits the parent runtime as a discouraged fallback.",
 	);
 	return lines.join("\n");
 }

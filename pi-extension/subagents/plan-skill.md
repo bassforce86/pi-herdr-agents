@@ -40,7 +40,7 @@ Phase 7: Review
 
 ## Runtime
 
-Set `model` and `thinking` on every spawn. Use an exact authenticated provider/model ID: a fast-tier model for scouts, a mid-tier model for ordinary workers, and a frontier-tier model only for architecture or hard diagnosis. Reviewers must use a different provider/family than workers. Do not omit `model` in this workflow.
+Set `model` and `thinking` on every spawn. For non-review roles, prefer a configured `task:<category>` or its curated shortlist: `recon` for scouts, `architecture` for planning and diagnosis, `coding` for workers, `qa` for runners, and `docs` for documentation. Reviewers must use an exact authenticated provider/model ID from a different provider/family than workers when the author family is known; do not use `task:review` for that exclusion. Do not omit `model` in this workflow.
 
 ## Fire-and-forget completion
 

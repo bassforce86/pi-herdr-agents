@@ -22,7 +22,7 @@ import {
 	statSync,
 } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
+
 import {
 	isTerminalAvailable,
 	terminalSetupHint,
@@ -45,6 +45,7 @@ import {
 import { loadSupervisionConfig } from "./supervision-config.ts";
 import {
 	buildAuthenticatedModelCatalog,
+	parseExactModelRef,
 	resolveRuntimePlan,
 	resolveRuntimePlans,
 	wrapPiModelRegistry,
@@ -53,7 +54,18 @@ import {
 	type ResolvedRuntimePlan,
 	type ThinkingLevel,
 } from "./runtime-routing.ts";
-import { loadModelConfig, resolveModelDefault } from "./model-config.ts";
+import {
+	loadModelConfig,
+	resolveModelDefault,
+	writeTaskModelConfig,
+	type TaskPreferences,
+	type TaskPreferencesMeta,
+} from "./model-config.ts";
+import {
+	getAgentConfigDir,
+	getSubagentsConfigExamplePath,
+	getSubagentsConfigPath,
+} from "./config-path.ts";
 import { loadRoleConfig, type RoleConfig } from "./role-config.ts";
 import {
 	loadPersistentConfig,
@@ -188,12 +200,21 @@ function getFirstText(
 	}
 }
 
-function buildSubagentRoutingGuidelines(catalog?: string): string[] {
+function buildSubagentRoutingGuidelines(
+	catalog?: string,
+	hasTaskPreferences = false,
+): string[] {
 	return [
 		"Act as the coordinator: decompose the work, give each child one bounded outcome — goal, allowed files, verification, and whether to commit — and keep dependent writes sequential; parallelize only independent tasks.",
 		"Children are leaves by default: they do not push, merge, deploy, or orchestrate further agents unless their task explicitly authorizes it. The parent inspects each result or worktree handoff (diff against the reported base, run relevant tests) and owns integration, verification, and cleanup.",
-		"For orchestrated subagent work, explicitly set both model and thinking for every child: first choose a fast, mid, or frontier provider-family tier matched to task complexity, then set thinking within that model's supported range.",
-		"Use fast tier for bounded mechanical work and recon, mid tier for ordinary implementation or review, and frontier tier for architecture, security, hard diagnosis, or adversarial review. Use minimal/low thinking for mechanical work, medium for ordinary work, and high+ for hard work.",
+		...(hasTaskPreferences
+			? [
+					"For non-review work, prefer the configured task-category shortlists below and use task:<category> only as the entire model value. Use exact IDs for reviews when the authoring family is known.",
+				]
+			: [
+					"For orchestrated subagent work, explicitly set both model and thinking for every child: first choose a fast, mid, or frontier provider-family tier matched to task complexity, then set thinking within that model's supported range.",
+					"Use fast tier for bounded mechanical work and recon, mid tier for ordinary implementation or review, and frontier tier for architecture, security, hard diagnosis, or adversarial review. Use minimal/low thinking for mechanical work, medium for ordinary work, and high+ for hard work.",
+				]),
 		"Review agents must use a different provider/family than the model that produced the work; a stronger model in the same family is quality escalation, not independent review. Use an exact authenticated provider/model-id from the live catalog below, never an alias or fuzzy name.",
 		"Omitting model and thinking still inherits the parent runtime, but this is a discouraged fallback for orchestrated children.",
 		"Before launching a new group of subagents, choose a short task slug and name each new child <task>-<role>[-n], for example login-api or login-test2. Use only plan, research, ui, api, build, test, review, browser, security, perf, or merge as roles; leave existing names unchanged. After the final launch, print name | agent kind | role | model | worktree (if any), then use each name in prompts, handoffs, and results.",
@@ -233,7 +254,7 @@ const SubagentParams = Type.Object({
 	model: Type.Optional(
 		Type.String({
 			description:
-				"Explicitly pick an exact authenticated provider/model-id in a fast, mid, or frontier provider-family tier matched to the task, or use an ordered comma-separated fallback list. Review must use a different provider/family than the producing model. Omitting still inherits the parent model; do not omit for orchestrated children. Fallbacks are Pi-backed only and cannot be used with worktrees.",
+				"Explicitly pick an exact authenticated provider/model-id, an ordered comma-separated fallback list, or task:<category> as the entire value. task: categories are case-insensitive and expand configured authenticated candidates; worktrees use only the first. Review must use a different provider/family than the producing model. Omitting still inherits the parent model; do not omit for orchestrated children. Fallback lists cannot be used with worktrees.",
 		}),
 	),
 	thinking: Type.Optional(ThinkingLevelSchema),
@@ -372,11 +393,6 @@ function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
 	}
 
 	return denied;
-}
-
-/** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
-function getAgentConfigDir(): string {
-	return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
 function getBundledAgentsDir(): string {
@@ -2582,6 +2598,8 @@ function resolveSubagentRuntimePlans(
 			thinking: parentThinking,
 		},
 		wrapPiModelRegistry(ctx.modelRegistry),
+		modelConfig.tasks,
+		!!params.worktree,
 	);
 	if (params.worktree && plans.length > 1) {
 		throw new Error(
@@ -3081,9 +3099,12 @@ export default function subagentsExtension(
 		runtime.latestCtx = ctx;
 		runtime.modelCatalog = buildAuthenticatedModelCatalog(
 			wrapPiModelRegistry(ctx.modelRegistry),
+			24,
+			modelConfig.tasks,
 		);
 		const refreshedGuidelines = buildSubagentRoutingGuidelines(
 			runtime.modelCatalog,
+			Object.keys(modelConfig.tasks ?? {}).length > 0,
 		);
 		subagentRoutingGuidelines.splice(
 			0,
@@ -3189,6 +3210,51 @@ export default function subagentsExtension(
 			},
 		});
 	}
+
+	if (shouldRegister("subagents_write_task_models"))
+		pi.registerTool({
+			name: "subagents_write_task_models",
+			label: "Write task model preferences",
+			description:
+				"Validate and atomically write models.tasks and models.tasksMeta to the durable Pi agent config. Use only after reviewing an authenticated registry.",
+			parameters: Type.Object({
+				tasks: Type.Record(Type.String(), Type.Array(Type.String())),
+				tasksMeta: Type.Object({
+					generatedAt: Type.String(),
+					method: Type.Union([
+						Type.Literal("research"),
+						Type.Literal("registry-only"),
+					]),
+				}),
+			}),
+			execute: async (_id, params, _signal, _update, ctx) => {
+				const registry = wrapPiModelRegistry(ctx.modelRegistry);
+				// SAFETY: TypeBox validates the tool payload; the write seam performs stricter schema validation.
+				const tasks = params.tasks as TaskPreferences;
+				// SAFETY: TypeBox validates the tool payload; the write seam performs stricter schema validation.
+				const tasksMeta = params.tasksMeta as TaskPreferencesMeta;
+				writeTaskModelConfig(
+					getSubagentsConfigPath(),
+					getSubagentsConfigExamplePath(),
+					tasks,
+					tasksMeta,
+					(candidate) => {
+						const parsed = parseExactModelRef(candidate);
+						const model =
+							parsed && registry.find(parsed.provider, parsed.modelId);
+						return !!model && registry.hasConfiguredAuth(model);
+					},
+				);
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Wrote task model preferences to ${getSubagentsConfigPath()}. Reload required.`,
+						},
+					],
+				};
+			},
+		});
 
 	// ── subagent tool ──
 	if (shouldRegister("subagent"))
@@ -4026,6 +4092,16 @@ export default function subagentsExtension(
 				};
 			},
 		});
+
+	pi.registerCommand("subagents-init", {
+		description:
+			"Draft task-category model preferences from the authenticated registry",
+		handler: async (_args, _ctx) => {
+			pi.sendUserMessage(
+				"Initialize task-model routing. Inspect the authenticated model registry object (including provider, model ID, cost, context window, and reasoning support), not the rendered catalog. Research current task fit using available web search; if unavailable, rank from the registry and set tasksMeta.method to registry-only. Draft every supported category with authenticated candidates, then call subagents_write_task_models. In your summary, show a category-to-candidates table, generatedAt and method, state whether research informed the ranking, and instruct the user to run /reload (or start a new session) before task:<category> and guidance update.",
+			);
+		},
+	});
 
 	pi.registerCommand("btw", {
 		description:

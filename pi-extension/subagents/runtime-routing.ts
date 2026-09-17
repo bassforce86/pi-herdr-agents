@@ -317,12 +317,19 @@ export function resolveRuntimePlans(
 
 	let references: string[];
 	const trimmed = selection.value.trim();
+	if (
+		selection.value
+			.split(",")
+			.some((candidate) =>
+				candidate.trim().toLowerCase().startsWith("task:"),
+			) &&
+		trimmed.includes(",")
+	) {
+		throw new RuntimeResolutionError(
+			"task: references must be the entire model value, not part of a fallback list",
+		);
+	}
 	if (trimmed.toLowerCase().startsWith("task:")) {
-		if (trimmed.includes(",")) {
-			throw new RuntimeResolutionError(
-				"task: references must be the entire model value, not part of a fallback list",
-			);
-		}
 		if (selection.source !== "request") {
 			throw new RuntimeResolutionError(
 				"task: references are only valid in the subagent tool's model parameter",
@@ -349,6 +356,7 @@ export function resolveRuntimePlans(
 		if (references.length === 0) {
 			const alternatives = registry
 				.available()
+				.filter((model) => registry.hasConfiguredAuth(model))
 				.map((model) => `${model.provider}/${model.id}`);
 			throw new RuntimeResolutionError(
 				`task category ${JSON.stringify(category)} has no authenticated candidates; authenticated alternatives: ${alternatives.join(", ") || "(none)"}`,
@@ -380,6 +388,25 @@ function formatTokenCount(value: number | undefined): string | undefined {
 	return String(value);
 }
 
+export function getAuthenticatedTaskPreferences(
+	registry: ModelRegistryAdapter,
+	taskPreferences?: TaskPreferences,
+): TaskPreferences {
+	const authenticated: TaskPreferences = {};
+	for (const [category, candidates] of Object.entries(taskPreferences ?? {})) {
+		const available = candidates.filter((candidate) => {
+			const parsed = parseExactModelRef(candidate);
+			const model = parsed && registry.find(parsed.provider, parsed.modelId);
+			return !!model && registry.hasConfiguredAuth(model);
+		});
+		if (available.length > 0) {
+			// SAFETY: parsed task preferences can only contain supported category keys.
+			authenticated[category as keyof TaskPreferences] = available;
+		}
+	}
+	return authenticated;
+}
+
 export function buildAuthenticatedModelCatalog(
 	registry: ModelRegistryAdapter,
 	limit = 24,
@@ -387,6 +414,7 @@ export function buildAuthenticatedModelCatalog(
 ): string {
 	const models = registry
 		.available()
+		.filter((model) => registry.hasConfiguredAuth(model))
 		.sort((a, b) =>
 			`${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`),
 		);
@@ -419,20 +447,9 @@ export function buildAuthenticatedModelCatalog(
 			`- … ${models.length - visibleModels.length} more authenticated models omitted`,
 		);
 	}
-	const configured = Object.entries(taskPreferences ?? {})
-		.map(
-			([category, candidates]) =>
-				[
-					category,
-					candidates.filter((candidate) => {
-						const parsed = parseExactModelRef(candidate);
-						const model =
-							parsed && registry.find(parsed.provider, parsed.modelId);
-						return !!model && registry.hasConfiguredAuth(model);
-					}),
-				] as const,
-		)
-		.filter(([, candidates]) => candidates.length > 0);
+	const configured = Object.entries(
+		getAuthenticatedTaskPreferences(registry, taskPreferences),
+	);
 	if (configured.length > 0) {
 		lines.push(
 			"Task-category shortlists (use task:<category> only as the entire model value):",

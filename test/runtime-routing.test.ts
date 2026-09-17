@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
 	RuntimeResolutionError,
 	buildAuthenticatedModelCatalog,
+	getAuthenticatedTaskPreferences,
 	resolveRuntimePlan,
 	resolveRuntimePlans,
 	wrapPiModelRegistry,
@@ -180,17 +181,22 @@ describe("runtime routing", () => {
 			).map((plan) => plan.model),
 			["other/worker"],
 		);
-		assert.throws(
-			() =>
-				resolveRuntimePlans(
-					{ model: "task:coding, other/backup" },
-					{},
-					parent,
-					registry(entries),
-					tasks,
-				),
-			/must be the entire model value/,
-		);
+		for (const modelReference of [
+			"task:coding, other/backup",
+			"other/backup, task:coding",
+		]) {
+			assert.throws(
+				() =>
+					resolveRuntimePlans(
+						{ model: modelReference },
+						{},
+						parent,
+						registry(entries),
+						tasks,
+					),
+				/must be the entire model value/,
+			);
+		}
 		assert.throws(
 			() =>
 				resolveRuntimePlans(
@@ -212,6 +218,17 @@ describe("runtime routing", () => {
 					tasks,
 				),
 			/only valid in the subagent tool's model parameter/,
+		);
+		assert.throws(
+			() =>
+				resolveRuntimePlans(
+					{ model: "task:coding" },
+					{},
+					parent,
+					registry([model("fake", "parent"), model("other", "unauthed")]),
+					{ coding: ["other/unauthed"] },
+				),
+			/task category "coding" has no authenticated candidates; authenticated alternatives: fake\/parent/,
 		);
 	});
 
@@ -327,6 +344,49 @@ describe("authenticated model catalog", () => {
 			catalog,
 			/inherits the parent runtime as a discouraged fallback/,
 		);
+	});
+
+	it("renders authenticated configured shortlists in order with review guidance", () => {
+		const entries = [
+			model("fake", "parent"),
+			model("other", "first"),
+			model("other", "second"),
+			model("other", "unauthed"),
+		];
+		const tasks = {
+			coding: ["other/second", "other/unauthed", "other/first"],
+			review: ["fake/parent"],
+		};
+		assert.deepEqual(
+			getAuthenticatedTaskPreferences(registry(entries), tasks),
+			{
+				coding: ["other/second", "other/first"],
+				review: ["fake/parent"],
+			},
+		);
+		const catalog = buildAuthenticatedModelCatalog(
+			registry(entries),
+			24,
+			tasks,
+		);
+		assert.match(catalog, /- coding: other\/second, other\/first/);
+		assert.match(catalog, /- review: fake\/parent/);
+		assert.doesNotMatch(catalog, /other\/unauthed/);
+		assert.match(
+			catalog,
+			/use an exact provider\/model-id; the extension does not enforce this/,
+		);
+	});
+
+	it("keeps generic tier guidance when shortlists are empty or unconfigured", () => {
+		for (const tasks of [undefined, {}]) {
+			const catalog = buildAuthenticatedModelCatalog(registry(), 24, tasks);
+			assert.match(
+				catalog,
+				/explicitly select an exact provider\/model-id by task tier first/,
+			);
+			assert.doesNotMatch(catalog, /Task-category shortlists/);
+		}
 	});
 
 	it("caps large catalogs and reports omitted models", () => {

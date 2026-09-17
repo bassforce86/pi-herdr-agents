@@ -16,6 +16,7 @@ import { dirname, join } from "node:path";
 import {
 	getSubagentsConfigPath,
 	getSubagentsConfigExamplePath,
+	getSubagentsPackageRoot,
 } from "../pi-extension/subagents/config-path.ts";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -1940,6 +1941,40 @@ describe("shared subagent configuration path", () => {
 		assert.equal(example.models.tasks, undefined);
 	});
 
+	it("ignores a decoy package-root config.json in every reader", () => {
+		withTempDir((dir) => {
+			const decoyPath = join(getSubagentsPackageRoot(), "config.json");
+			const previousDecoy = existsSync(decoyPath)
+				? readFileSync(decoyPath, "utf8")
+				: undefined;
+			const previous = process.env.PI_CODING_AGENT_DIR;
+			process.env.PI_CODING_AGENT_DIR = dir;
+			try {
+				writeFileSync(
+					decoyPath,
+					JSON.stringify({
+						status: { enabled: false },
+						models: { default: "decoy/model" },
+						roles: { bundled: false },
+						panes: { mode: "tab" },
+						supervision: { forcePolling: true },
+						persistent: { maxAgents: 1 },
+					}),
+				);
+				assert.deepEqual(loadModelConfig(), { agents: {} });
+				assert.equal(loadRoleConfig().bundled, true);
+				assert.equal(loadPaneConfig().mode, "grouped");
+				assert.equal(loadSupervisionConfig().forcePolling, false);
+				assert.equal(loadPersistentConfig().maxAgents, 3);
+				assert.equal(loadStatusConfig().enabled, true);
+			} finally {
+				restoreEnvVar("PI_CODING_AGENT_DIR", previous);
+				if (previousDecoy == null) rmSync(decoyPath, { force: true });
+				else writeFileSync(decoyPath, previousDecoy);
+			}
+		});
+	});
+
 	it("routes every config reader through the user config path", () => {
 		withTempDir((dir) => {
 			const previous = process.env.PI_CODING_AGENT_DIR;
@@ -2202,6 +2237,32 @@ describe("model configuration", () => {
 		});
 	});
 
+	it("seeds from the packaged example and keeps every config section loadable", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "herdr-agents", "config.json");
+			const examplePath = getSubagentsConfigExamplePath();
+			writeTaskModelConfig(
+				configPath,
+				examplePath,
+				{ coding: ["fake/worker"] },
+				{ generatedAt: "2026-09-17T00:00:00Z", method: "research" },
+				(candidate) => candidate === "fake/worker",
+			);
+			assert.equal(
+				loadModelConfig(configPath).tasks?.coding?.[0],
+				"fake/worker",
+			);
+			assert.equal(loadRoleConfig(configPath, examplePath).bundled, true);
+			assert.equal(loadPaneConfig(configPath, examplePath).mode, "grouped");
+			assert.equal(
+				loadSupervisionConfig(configPath, examplePath).forcePolling,
+				false,
+			);
+			assert.equal(loadPersistentConfig(configPath, examplePath).maxAgents, 3);
+			assert.equal(loadStatusConfig(configPath, examplePath).enabled, true);
+		});
+	});
+
 	it("writes only validated task preferences into a seeded user config", () => {
 		withTempDir((dir) => {
 			const configPath = join(dir, "herdr-agents", "config.json");
@@ -2249,6 +2310,68 @@ describe("model configuration", () => {
 		});
 	});
 
+	it("repairs invalid existing task preferences without rewriting other model keys", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			writeFileSync(
+				configPath,
+				JSON.stringify({
+					status: { enabled: false },
+					models: { default: "fake/default", tasks: { coding: null } },
+				}),
+			);
+			writeTaskModelConfig(
+				configPath,
+				getSubagentsConfigExamplePath(),
+				{ coding: ["fake/worker"] },
+				{ generatedAt: "2026-09-17T00:00:00Z", method: "research" },
+				(candidate) => candidate === "fake/worker",
+			);
+			assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), {
+				status: { enabled: false },
+				models: {
+					default: "fake/default",
+					tasks: { coding: ["fake/worker"] },
+					tasksMeta: {
+						generatedAt: "2026-09-17T00:00:00Z",
+						method: "research",
+					},
+				},
+			});
+		});
+	});
+
+	it("writes through an exclusive sibling temporary file before rename", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			const writes: Array<{ path: string; options: unknown }> = [];
+			const renames: Array<{ from: string; to: string }> = [];
+			writeTaskModelConfig(
+				configPath,
+				getSubagentsConfigExamplePath(),
+				{ coding: ["fake/worker"] },
+				{ generatedAt: "2026-09-17T00:00:00Z", method: "research" },
+				(candidate) => candidate === "fake/worker",
+				{
+					writeFileSync(path, data, options) {
+						writes.push({ path: String(path), options });
+						writeFileSync(path, data, options);
+					},
+					renameSync(from, to) {
+						renames.push({ from: String(from), to: String(to) });
+						renameSync(from, to);
+					},
+				},
+			);
+			assert.equal(writes.length, 1);
+			assert.equal(dirname(writes[0].path), dirname(configPath));
+			assert.match(writes[0].path, /-config\.tmp$/);
+			assert.deepEqual(writes[0].options, { flag: "wx" });
+			assert.deepEqual(renames, [{ from: writes[0].path, to: configPath }]);
+			assert.equal(existsSync(writes[0].path), false);
+		});
+	});
+
 	it("rejects invalid model configuration", () => {
 		assert.throws(
 			() => parseModelConfig({ models: { default: "" } }),
@@ -2257,6 +2380,51 @@ describe("model configuration", () => {
 		assert.throws(
 			() => parseModelConfig({ models: { agents: [] } }),
 			/must be an object/,
+		);
+		assert.throws(
+			() => parseModelConfig({ models: { tasks: { debugging: ["fake/x"] } } }),
+			/models\.tasks\.debugging.*supported categories: coding, review, recon, qa, architecture, docs/,
+		);
+		assert.throws(
+			() => parseModelConfig({ models: { tasks: { coding: null } } }),
+			/models\.tasks\.coding must be a non-empty list/,
+		);
+		assert.throws(
+			() =>
+				parseModelConfig({
+					models: {
+						tasksMeta: {
+							generatedAt: "2026-09-17T00:00:00Z",
+							method: "guesswork",
+						},
+					},
+				}),
+			/models\.tasksMeta\.method must be "research" or "registry-only"/,
+		);
+		assert.throws(
+			() =>
+				parseModelConfig({
+					models: {
+						tasksMeta: {
+							generatedAt: "2026-09-17",
+							method: "research",
+						},
+					},
+				}),
+			/models\.tasksMeta\.generatedAt must be an ISO-8601 string/,
+		);
+		assert.throws(
+			() =>
+				parseModelConfig({
+					models: {
+						tasksMeta: {
+							generatedAt: "2026-09-17T00:00:00Z",
+							method: "research",
+							extra: true,
+						},
+					},
+				}),
+			/models\.tasksMeta has unsupported key\(s\): extra/,
 		);
 	});
 });
@@ -5959,6 +6127,23 @@ describe("tool registration", () => {
 		assert.match(subagent.promptGuidelines.join("\n"), /login-test2/);
 	});
 
+	it("renders generic routing tiers only when no authenticated shortlist is available", () => {
+		const configured = subagentsModule.__test__
+			.buildSubagentRoutingGuidelines("catalog", { coding: ["fake/worker"] })
+			.join("\n");
+		assert.match(configured, /prefer the configured task-category shortlists/);
+		assert.doesNotMatch(configured, /first choose a fast, mid, or frontier/);
+
+		const generic = subagentsModule.__test__
+			.buildSubagentRoutingGuidelines("catalog", {})
+			.join("\n");
+		assert.match(generic, /first choose a fast, mid, or frontier/);
+		assert.doesNotMatch(
+			generic,
+			/prefer the configured task-category shortlists/,
+		);
+	});
+
 	it("ignores an inherited deny list in a parent process", () => {
 		delete process.env.PI_SUBAGENT_ID;
 		process.env.PI_DENY_TOOLS =
@@ -5983,7 +6168,8 @@ describe("tool registration", () => {
 		process.env.PI_SUBAGENT_ID = "child-test";
 		process.env.PI_DENY_TOOLS = "subagent,subagent_interrupt";
 		try {
-			const { api, registeredTools } = createMockExtensionApi();
+			const { api, registeredTools, registeredCommands } =
+				createMockExtensionApi();
 			subagentsModule.default(api);
 			assert.equal(
 				registeredTools.some((tool) => tool.name === "subagent"),
@@ -5996,6 +6182,16 @@ describe("tool registration", () => {
 			assert.equal(
 				registeredTools.some((tool) => tool.name === "subagents_list"),
 				true,
+			);
+			assert.equal(
+				registeredTools.some(
+					(tool) => tool.name === "subagents_write_task_models",
+				),
+				false,
+			);
+			assert.equal(
+				registeredCommands.some((command) => command.name === "subagents-init"),
+				false,
 			);
 		} finally {
 			delete process.env.PI_SUBAGENT_ID;
@@ -6010,6 +6206,7 @@ describe("tool registration", () => {
 		assert.equal(denied.has("subagent"), true);
 		assert.equal(denied.has("subagent_interrupt"), true);
 		assert.equal(denied.has("subagent_resume"), true);
+		assert.equal(denied.has("subagents_write_task_models"), true);
 	});
 
 	it("exposes worktree branch and optional base on the subagent tool", () => {

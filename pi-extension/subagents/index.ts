@@ -45,6 +45,7 @@ import {
 import { loadSupervisionConfig } from "./supervision-config.ts";
 import {
 	buildAuthenticatedModelCatalog,
+	getAuthenticatedTaskPreferences,
 	parseExactModelRef,
 	resolveRuntimePlan,
 	resolveRuntimePlans,
@@ -202,12 +203,12 @@ function getFirstText(
 
 function buildSubagentRoutingGuidelines(
 	catalog?: string,
-	hasTaskPreferences = false,
+	authenticatedTaskPreferences?: TaskPreferences,
 ): string[] {
 	return [
 		"Act as the coordinator: decompose the work, give each child one bounded outcome — goal, allowed files, verification, and whether to commit — and keep dependent writes sequential; parallelize only independent tasks.",
 		"Children are leaves by default: they do not push, merge, deploy, or orchestrate further agents unless their task explicitly authorizes it. The parent inspects each result or worktree handoff (diff against the reported base, run relevant tests) and owns integration, verification, and cleanup.",
-		...(hasTaskPreferences
+		...(Object.keys(authenticatedTaskPreferences ?? {}).length > 0
 			? [
 					"For non-review work, prefer the configured task-category shortlists below and use task:<category> only as the entire model value. Use exact IDs for reviews when the authoring family is known.",
 				]
@@ -366,6 +367,7 @@ const SPAWNING_TOOLS = new Set([
 	"subagent_resume",
 	"subagent_send",
 	"subagent_stop",
+	"subagents_write_task_models",
 ]);
 
 /**
@@ -2401,6 +2403,7 @@ export const __test__ = {
 	evaluateNoProgressAdvisory,
 	formatNoProgressAdvisoryLine,
 	resolveDenyTools,
+	buildSubagentRoutingGuidelines,
 	resolveInterruptTarget,
 	requestSubagentInterrupt,
 	handleSubagentInterrupt,
@@ -3097,14 +3100,19 @@ export default function subagentsExtension(
 	// subagents whose watchers survived a reload.
 	pi.on("session_start", async (_event, ctx) => {
 		runtime.latestCtx = ctx;
+		const registry = wrapPiModelRegistry(ctx.modelRegistry);
+		const authenticatedTaskPreferences = getAuthenticatedTaskPreferences(
+			registry,
+			modelConfig.tasks,
+		);
 		runtime.modelCatalog = buildAuthenticatedModelCatalog(
-			wrapPiModelRegistry(ctx.modelRegistry),
+			registry,
 			24,
 			modelConfig.tasks,
 		);
 		const refreshedGuidelines = buildSubagentRoutingGuidelines(
 			runtime.modelCatalog,
-			Object.keys(modelConfig.tasks ?? {}).length > 0,
+			authenticatedTaskPreferences,
 		);
 		subagentRoutingGuidelines.splice(
 			0,
@@ -3211,7 +3219,10 @@ export default function subagentsExtension(
 		});
 	}
 
-	if (shouldRegister("subagents_write_task_models"))
+	if (
+		!process.env.PI_SUBAGENT_ID &&
+		shouldRegister("subagents_write_task_models")
+	)
 		pi.registerTool({
 			name: "subagents_write_task_models",
 			label: "Write task model preferences",
@@ -4093,15 +4104,16 @@ export default function subagentsExtension(
 			},
 		});
 
-	pi.registerCommand("subagents-init", {
-		description:
-			"Draft task-category model preferences from the authenticated registry",
-		handler: async (_args, _ctx) => {
-			pi.sendUserMessage(
-				"Initialize task-model routing. Inspect the authenticated model registry object (including provider, model ID, cost, context window, and reasoning support), not the rendered catalog. Research current task fit using available web search; if unavailable, rank from the registry and set tasksMeta.method to registry-only. Draft every supported category with authenticated candidates, then call subagents_write_task_models. In your summary, show a category-to-candidates table, generatedAt and method, state whether research informed the ranking, and instruct the user to run /reload (or start a new session) before task:<category> and guidance update.",
-			);
-		},
-	});
+	if (!process.env.PI_SUBAGENT_ID)
+		pi.registerCommand("subagents-init", {
+			description:
+				"Draft task-category model preferences from the authenticated registry",
+			handler: async (_args, _ctx) => {
+				pi.sendUserMessage(
+					"Initialize task-model routing. Inspect the authenticated model registry object (including provider, model ID, cost, context window, and reasoning support), not the rendered catalog. Research current task fit using available web search; if unavailable, rank from the registry and set tasksMeta.method to registry-only. Draft every supported category with authenticated candidates, then call subagents_write_task_models. In your summary, show a category-to-candidates table, generatedAt and method, state whether research informed the ranking, and instruct the user to run /reload (or start a new session) before task:<category> and guidance update.",
+				);
+			},
+		});
 
 	pi.registerCommand("btw", {
 		description:

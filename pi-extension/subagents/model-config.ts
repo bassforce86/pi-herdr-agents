@@ -60,8 +60,8 @@ function parseTasks(value: any, source: string): TaskPreferences | undefined {
 	}
 	const tasks: TaskPreferences = {};
 	for (const category of TASK_CATEGORIES) {
+		if (!Object.hasOwn(value, category)) continue;
 		const candidates = value[category];
-		if (candidates == null) continue;
 		if (!Array.isArray(candidates) || candidates.length === 0) {
 			invalidModelConfig(
 				source,
@@ -88,8 +88,20 @@ function parseTasksMeta(
 	if (value == null) return undefined;
 	if (!isPlainObject(value))
 		invalidModelConfig(source, "models.tasksMeta must be an object");
+	const unsupported = Object.keys(value).filter(
+		(key) => key !== "generatedAt" && key !== "method",
+	);
+	if (unsupported.length > 0) {
+		invalidModelConfig(
+			source,
+			`models.tasksMeta has unsupported key(s): ${unsupported.join(", ")}`,
+		);
+	}
 	if (
 		!isString(value.generatedAt) ||
+		!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(
+			value.generatedAt,
+		) ||
 		Number.isNaN(Date.parse(value.generatedAt))
 	) {
 		invalidModelConfig(
@@ -204,6 +216,10 @@ export function writeTaskModelConfig(
 	tasks: TaskPreferences,
 	tasksMeta: TaskPreferencesMeta,
 	isAuthenticatedCandidate: (candidate: string) => boolean,
+	fileOperations: Pick<
+		typeof import("node:fs"),
+		"renameSync" | "writeFileSync"
+	> = { renameSync, writeFileSync },
 ): void {
 	const candidateConfig = parseModelConfig(
 		{ models: { tasks, tasksMeta } },
@@ -219,31 +235,21 @@ export function writeTaskModelConfig(
 		}
 	}
 	mkdirSync(dirname(configPath), { recursive: true });
-	if (!readFileIfExists(configPath)) {
-		const example = readFileSync(examplePath, "utf8");
-		try {
-			JSON.parse(example);
-		} catch (error) {
-			throw new Error(
-				`Invalid JSON in subagent config example ${examplePath}: ${error instanceof Error ? error.message : String(error)}`,
-			);
-		}
-		writeFileSync(configPath, example);
-	}
-	const current = readFileSync(configPath, "utf8");
+	const current = readFileIfExists(configPath);
+	const source = current ?? readFileSync(examplePath, "utf8");
 	let parsed: any;
 	try {
-		parsed = JSON.parse(current);
+		parsed = JSON.parse(source);
 	} catch (error) {
+		const path = current == null ? examplePath : configPath;
 		throw new Error(
-			`Invalid JSON in subagent config ${configPath}: ${error instanceof Error ? error.message : String(error)}`,
+			`Invalid JSON in subagent config ${path}: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
 	if (!isPlainObject(parsed))
 		throw new Error(
 			`Invalid JSON in subagent config ${configPath}: root must be an object`,
 		);
-	parseModelConfig(parsed, configPath);
 	const models = isPlainObject(parsed.models) ? { ...parsed.models } : {};
 	models.tasks = candidateConfig.tasks;
 	models.tasksMeta = candidateConfig.tasksMeta;
@@ -252,8 +258,8 @@ export function writeTaskModelConfig(
 		dirname(configPath),
 		`.${Date.now()}-${process.pid}-config.tmp`,
 	);
-	writeFileSync(temporary, output);
-	renameSync(temporary, configPath);
+	fileOperations.writeFileSync(temporary, output, { flag: "wx" });
+	fileOperations.renameSync(temporary, configPath);
 }
 
 function readFileIfExists(path: string): string | undefined {

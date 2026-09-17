@@ -119,7 +119,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 
 ### Extensions
 
-**Subagents** — 8 main-session tools + 6 commands, plus 2 child-only tools:
+**Subagents** — 9 parent-session tools + 7 commands, plus 2 child-only tools:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
@@ -131,6 +131,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | `worktree_list` | Parent-only inspect-only inventory of managed worktrees and cleanup blockers |
 | `worktree_remove` | Parent-only explicit removal by `target` path, branch, or workspace ID; optional `preserve: true` commits dirty state first |
 | `subagent_resume`    | Resume a previous Pi-backed sub-agent session in a new ordinary pane (async)                          |
+| `subagents_write_task_models` | Parent-only internal tool that validates and atomically writes `models.tasks` preferences |
 
 | Pi child-only tool | Description |
 | ---------------- | ------------------------------------------------------------------------- |
@@ -145,6 +146,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | `/btw-close`               | Close the current BTW session        |
 | `/worktree <name> [task]`  | Continue this session in a new managed worktree (`/worktree list` lists them) |
 | `/subagent <agent> <task>` | Spawn a named agent directly (`/subagent list` lists available agents) |
+| `/subagents-init` | Draft task-category model preferences from the authenticated registry |
 
 ### Taxonomy and discovery
 

@@ -41,7 +41,7 @@ The optional live-provider smoke test is not a release gate:
 PI_TEST_MODEL="openai-codex/gpt-5.6-luna" PI_TEST_TIMEOUT=180000 npm run test:integration:live
 ```
 
-Do not release from skipped Herdr tests. Confirm the package preview includes `README.md`, `CHANGELOG.md`, `AGENTS.md`, `docs/`, `agents/`, `skills/orchestrate/SKILL.md`, `skills/orchestrate/adversarial-review.md`, `skills/orchestrate/adversarial-review-example.js`, and excludes `pi-extension/subagents/workflow-worker.js`. Confirm it excludes plans, journals, sessions, prototypes, generated evidence, and local `config.json`, and that the worktree integration tests leave no test workspace behind.
+Do not release from skipped Herdr tests. Confirm the package preview includes `README.md`, `CHANGELOG.md`, `AGENTS.md`, `docs/`, `agents/`, `skills/orchestrate/SKILL.md`, `skills/orchestrate/adversarial-review.md`, `skills/orchestrate/adversarial-review-example.js`, and excludes `pi-extension/subagents/workflow-worker.js`. Confirm it excludes plans, journals, sessions, prototypes, generated evidence, local `config.json` and `openspec/`, and that the worktree integration tests leave no test workspace behind. Durable user configuration is `$PI_CODING_AGENT_DIR/herdr-agents/config.json`; package-root configuration is ignored, so users must move an older file manually or re-run `/subagents-init`.
 
 ## npm authentication
 

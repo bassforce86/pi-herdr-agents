@@ -1,11 +1,9 @@
 import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import {
+	getSubagentsConfigExamplePath,
+	getSubagentsConfigPath,
+} from "./config-path.ts";
 import { isPlainObject, isString } from "./type-guards.ts";
-
-const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const DEFAULT_PANE_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
-const PANE_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
 
 export type PaneMode = "grouped" | "tab" | "split";
 export type PaneDirection = "right" | "down";
@@ -135,8 +133,8 @@ function readPaneConfigFile(
 }
 
 export function loadPaneConfig(
-	configPath = DEFAULT_PANE_CONFIG_PATH,
-	examplePath = PANE_CONFIG_EXAMPLE_PATH,
+	configPath = getSubagentsConfigPath(),
+	examplePath = getSubagentsConfigExamplePath(),
 ): PaneConfig {
 	const { sourcePath, rawConfig } = readPaneConfigFile(configPath, examplePath);
 	let parsed;

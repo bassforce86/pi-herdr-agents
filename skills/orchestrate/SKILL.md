@@ -35,7 +35,9 @@ drift makes the review `INCOMPLETE`.
 
 Launch at least two fresh discovery reviewers in ordinary panes with public
 `subagent()` calls. Set an exact authenticated `provider/model-id` and supported
-`thinking` value on every child; never inherit or guess either value. Exclude
+`thinking` value on every child; never inherit or guess either value. Curated
+task shortlists can guide non-review roles, but reviewers must use an exact ID,
+not `task:review`, when author-family exclusion is required. Exclude
 known author families when policy requires it. Different IDs in the same family
 are not independent review. Prefer a synthesis model family unused by discovery
 and disclose permitted reuse.

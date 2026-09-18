@@ -119,7 +119,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 
 ### Extensions
 
-**Subagents** — 8 main-session tools + 6 commands, plus 2 child-only tools:
+**Subagents** — 9 parent-session tools + 7 commands, plus 2 child-only tools:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
@@ -131,6 +131,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | `worktree_list` | Parent-only inspect-only inventory of managed worktrees and cleanup blockers |
 | `worktree_remove` | Parent-only explicit removal by `target` path, branch, or workspace ID; optional `preserve: true` commits dirty state first |
 | `subagent_resume`    | Resume a previous Pi-backed sub-agent session in a new ordinary pane (async)                          |
+| `subagents_write_task_models` | Parent-only internal tool that validates and atomically writes `models.tasks` preferences |
 
 | Pi child-only tool | Description |
 | ---------------- | ------------------------------------------------------------------------- |
@@ -145,6 +146,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | `/btw-close`               | Close the current BTW session        |
 | `/worktree <name> [task]`  | Continue this session in a new managed worktree (`/worktree list` lists them) |
 | `/subagent <agent> <task>` | Spawn a named agent directly (`/subagent list` lists available agents) |
+| `/subagents-init` | Draft task-category model preferences from the authenticated registry |
 
 ### Taxonomy and discovery
 
@@ -273,20 +275,13 @@ A fixed internal watchdog marks a run as `stalled` when pane inspection fails or
 
 #### Configuration
 
-The extension reads `config.json` from the installed package root—the directory
-containing this README and `package.json`, not `pi-extension/subagents/` or
-Herdr's `config.toml`. That file is package-local: npm or git package updates may
-overwrite it. Common global package roots are:
-
-- npm: `~/.pi/agent/npm/node_modules/pi-herdr-agents/`
-- git: `~/.pi/agent/git/<host>/<owner>/pi-herdr-agents/`
-
-Project-local installs use the corresponding `.pi/npm/` or `.pi/git/` root.
-From the actual package root, copy the example when you want local overrides:
-
-```bash
-cp config.json.example config.json
-```
+The durable user configuration is `$PI_CODING_AGENT_DIR/herdr-agents/config.json`,
+defaulting to `~/.pi/agent/herdr-agents/config.json`. It is not read from the
+installed package root, so npm and git package upgrades do not overwrite it.
+Create it by copying the installed package's `config.json.example`, or run
+`/subagents-init` to seed and draft model task preferences. This is a breaking
+migration: manually move an existing package-local `config.json` to this path,
+or re-run `/subagents-init`.
 
 ```json
 {
@@ -329,10 +324,33 @@ exact IDs from your authenticated model catalog:
     "agents": {
       "scout": "your-provider/your-fast-model",
       "reviewer": "your-provider/your-review-model"
+    },
+    "tasks": {
+      "coding": ["your-provider/your-coding-model"],
+      "review": ["your-provider/your-review-model"],
+      "recon": ["your-provider/your-fast-model"],
+      "qa": ["your-provider/your-qa-model"],
+      "architecture": ["your-provider/your-architecture-model"],
+      "docs": ["your-provider/your-docs-model"]
+    },
+    "tasksMeta": {
+      "generatedAt": "2026-09-17T00:00:00Z",
+      "method": "research"
     }
   }
 }
 ```
+
+`models.tasks` candidates are ordered exact authenticated IDs. Use
+`task:<category>` only in the `subagent` tool's `model` argument; it is not
+valid in frontmatter or model defaults. For review when the authoring family is
+known, choose an exact shortlist ID from a different family rather than
+`task:review`; this is guidance, not extension enforcement.
+
+Run `/subagents-init` to inspect the authenticated registry, research current
+task fit when search is available, write a validated draft, and show its table
+and generation metadata. It reports `registry-only` when research is unavailable.
+Run `/reload` (or start a new session) after it writes the draft.
 
 Set `persistent.maxAgents` to the maximum concurrently retained persistent specialists. It defaults to `3`; a persistent spawn at the cap is rejected before Herdr creates a pane or workspace, and no specialist is evicted.
 
@@ -346,7 +364,7 @@ collection; it never establishes a result by itself. If the watcher or shared
 pane inspection becomes unavailable, supervision quietly returns to the legacy
 one-second polling cadence. No caller action is required.
 
-Set `supervision.forcePolling` to `true` in the package-local `config.json` to
+Set `supervision.forcePolling` to `true` in the durable user `config.json` to
 disable wake-ups and use that legacy cadence deliberately. The setting is read
 when the coordinator is created, so run `/reload` after changing it.
 `subagents_list` reports the active transport mode (`wake+batch`,
@@ -407,7 +425,9 @@ Run `/reload` after changing role, model, or pane settings.
 followed by agent frontmatter, per-agent config, the global default, and finally
 the parent model. Model values must be exact authenticated `provider/model-id`
 references. A value can contain an ordered comma-separated fallback list, for
-example `provider/preferred, provider/fallback`. The extension validates every
+example `provider/preferred, provider/fallback`. The tool argument also accepts
+`task:<category>` as its complete value (not in a list), for configured
+`coding`, `review`, `recon`, `qa`, `architecture`, or `docs` preferences. The extension validates every
 candidate before launch, then launches later candidates only after the selected
 child settles with a provider/agent error. Pi owns any automatic transient
 retrying inside that child; the extension does not infer retry counts or
@@ -427,10 +447,9 @@ claim a permanent failure or a retry count that Pi has not exposed. Reliable
 structured permanence and retry counts require an upstream Pi/ExtensionAPI
 diagnostics seam for final provider errors and retry outcomes.
 
-`config.json` is gitignored in the source tree so local overrides are not
-committed from a checkout. On an installed package root, treat it as disposable
-local state that package updates may replace. Run `/reload` after changing it;
-status, model, role, and pane configuration are loaded when the extension starts.
+`config.json` is durable user state under the Pi agent directory and is loaded
+when the extension starts. Run `/reload` after changing it. Package-root
+`config.json` files are ignored; move them manually or re-run `/subagents-init`.
 
 ---
 
@@ -470,7 +489,7 @@ subagent({
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `persistent`           | boolean | `false`        | Keep one specialist session alive for sequential tasks; follow-ups use `subagent_send` only       |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
-| `model`                | string  | configured or parent | Exact authenticated `provider/model-id`, or an ordered comma-separated Pi fallback list; fallback lists are unavailable for worktree spawns. Resolution is tool argument → agent frontmatter → per-agent config → global config → parent |
+| `model`                | string  | configured or parent | Exact authenticated `provider/model-id`, ordered fallback list, or whole-value `task:<category>` (coding, review, recon, qa, architecture, docs). Task routing is tool-only; worktrees use its first authenticated candidate. Resolution is tool argument → agent frontmatter → per-agent config → global config → parent |
 | `thinking`             | string  | parent level   | Pick the model tier first, then set thinking within that model's range: minimal/low for bounded mechanical work, medium for ordinary implementation or review, high+ for architecture, security, or hard diagnosis. Omitting still inherits the parent level; this is a discouraged fallback for orchestrated children. |
 | `systemPrompt`         | string  | —              | Role/system-prompt text for a bare spawn; named agents keep their definition body                  |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |

@@ -40,7 +40,9 @@ identify missing evidence.
    `fork: false` does not override role `session-mode: fork`. Stop for a
    non-standalone or unknown mode so no reviewer inherits coordinator context.
 4. Use the model-catalog source identified by the `subagent` tool guidance or
-   another project-approved source. Record that source, how authentication was
+   another project-approved source. Curated task shortlists can inform selection,
+   but review must name an exact ID and exclude known author families; never use
+   `task:review` when that exclusion is required. Record that source, how authentication was
    confirmed, eligible distinct exact IDs, and only IDs actually considered but
    omitted, with reasons. Never guess unknown catalog entries. Identify every
    provider/model family that authored the reviewed material, or confirm that it

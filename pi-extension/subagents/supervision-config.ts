@@ -1,11 +1,9 @@
 import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import {
+	getSubagentsConfigExamplePath,
+	getSubagentsConfigPath,
+} from "./config-path.ts";
 import { isBoolean, isFiniteNumber, isRecord } from "./type-guards.ts";
-
-const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const DEFAULT_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
-const EXAMPLE_CONFIG_PATH = join(PACKAGE_ROOT, "config.json.example");
 
 export interface SupervisionConfig {
 	forcePolling: boolean;
@@ -64,8 +62,8 @@ export function parseSupervisionConfig(
 }
 
 export function loadSupervisionConfig(
-	configPath = DEFAULT_CONFIG_PATH,
-	examplePath = EXAMPLE_CONFIG_PATH,
+	configPath = getSubagentsConfigPath(),
+	examplePath = getSubagentsConfigExamplePath(),
 ): SupervisionConfig {
 	let sourcePath = configPath;
 	let rawConfig: string;

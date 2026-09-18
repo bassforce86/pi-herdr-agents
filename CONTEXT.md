@@ -136,3 +136,18 @@ Explicit opt-in staging and WIP commitment of a worktree's uncommitted and
 untracked files on its retained branch before rechecking removal eligibility.
 Ignored files are not captured. Commit failure restores the original index.
 _Avoid_: Implicit commit, stash, discard
+
+**Task-category model preference**:
+An ordered authenticated model shortlist in `models.tasks` for `coding`,
+`review`, `recon`, `qa`, `architecture`, or `docs`. Recon maps to scouts,
+architecture to planning and diagnosis, coding to workers, review to reviewers,
+QA to software runners, and docs to documentation workers. `task:<category>`
+is tool-only deterministic routing; reviews use exact IDs when author-family
+exclusion is needed.
+_Avoid_: Generic tier, reviewer-family enforcement
+
+**Loop template**:
+A future reusable orchestration definition beside `models`, describing stages,
+task categories, and a termination/report contract. Loop templates are not
+implemented by task-model routing.
+_Avoid_: Current executable workflow

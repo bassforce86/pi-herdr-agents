@@ -81,7 +81,7 @@ Within the package layer:
 
 - bundled roles are protected fallbacks while enabled;
 - a role pack colliding with an enabled bundled name is rejected;
-- copying `config.json.example` to package-local `config.json` and setting `roles.bundled` to `false` removes only the bundled layer; registered role packs remain package roles and may supply those names;
+- copying the packaged `config.json.example` to `$PI_CODING_AGENT_DIR/herdr-agents/config.json` and setting `roles.bundled` to `false` removes only the bundled layer; registered role packs remain package roles and may supply those names; package-root configuration is ignored, so manually move older files or re-run `/subagents-init`; 
 - a name contributed by multiple role packs is disabled;
 - collisions never resolve through incidental extension load order.
 
@@ -95,7 +95,7 @@ before Herdr creates a pane or worktree.
 ## Reload and security
 
 Role files are read on each list or launch, so editing Markdown does not require
-`/reload`. Changing package-local role configuration, installing, removing,
+`/reload`. Changing durable user role configuration, installing, removing,
 updating, or changing a role-pack extension uses Pi's normal reload flow.
 Contributor `session_shutdown` cleanup removes the
 old event listener before replacement extensions register. Already-running

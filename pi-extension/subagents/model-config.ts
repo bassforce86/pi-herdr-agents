@@ -1,76 +1,178 @@
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { getSubagentsConfigPath } from "./config-path.ts";
 import { isPlainObject, isString } from "./type-guards.ts";
 
-const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const DEFAULT_MODEL_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
+export const TASK_CATEGORIES = [
+	"coding",
+	"review",
+	"recon",
+	"qa",
+	"architecture",
+	"docs",
+] as const;
+export type TaskCategory = (typeof TASK_CATEGORIES)[number];
+export type TaskPreferences = Partial<Record<TaskCategory, string[]>>;
+export interface TaskPreferencesMeta {
+	generatedAt: string;
+	method: "research" | "registry-only";
+}
 
 export interface ModelConfig {
 	default?: string;
 	agents: Record<string, string>;
+	tasks?: TaskPreferences;
+	tasksMeta?: TaskPreferencesMeta;
 }
 
 function invalidModelConfig(source: string, message: string): never {
 	throw new Error(`Invalid subagent model config in ${source}: ${message}`);
 }
 
+function rejectTaskReference(
+	value: string,
+	field: string,
+	source: string,
+): void {
+	if (value.trim().toLowerCase().startsWith("task:")) {
+		invalidModelConfig(
+			source,
+			`${field} cannot use task: references; task: references are only valid in the subagent tool's model parameter`,
+		);
+	}
+}
+
+function parseTasks(value: any, source: string): TaskPreferences | undefined {
+	if (value == null) return undefined;
+	if (!isPlainObject(value))
+		invalidModelConfig(source, "models.tasks must be an object");
+	const keys = Object.keys(value);
+	if (keys.length === 0) return undefined;
+	const unsupported = keys.filter(
+		// SAFETY: this check only compares strings against the fixed category set.
+		(key) => !TASK_CATEGORIES.includes(key as TaskCategory),
+	);
+	if (unsupported.length > 0) {
+		invalidModelConfig(
+			source,
+			`models.tasks.${unsupported[0]} is unsupported; supported categories: ${TASK_CATEGORIES.join(", ")}`,
+		);
+	}
+	const tasks: TaskPreferences = {};
+	for (const category of TASK_CATEGORIES) {
+		if (!Object.hasOwn(value, category)) continue;
+		const candidates = value[category];
+		if (!Array.isArray(candidates) || candidates.length === 0) {
+			invalidModelConfig(
+				source,
+				`models.tasks.${category} must be a non-empty list`,
+			);
+		}
+		tasks[category] = candidates.map((candidate, index) => {
+			if (!isString(candidate) || candidate.trim() === "") {
+				invalidModelConfig(
+					source,
+					`models.tasks.${category}[${index}] must be a non-empty string`,
+				);
+			}
+			return candidate.trim();
+		});
+	}
+	return tasks;
+}
+
+function parseTasksMeta(
+	value: any,
+	source: string,
+): TaskPreferencesMeta | undefined {
+	if (value == null) return undefined;
+	if (!isPlainObject(value))
+		invalidModelConfig(source, "models.tasksMeta must be an object");
+	const unsupported = Object.keys(value).filter(
+		(key) => key !== "generatedAt" && key !== "method",
+	);
+	if (unsupported.length > 0) {
+		invalidModelConfig(
+			source,
+			`models.tasksMeta has unsupported key(s): ${unsupported.join(", ")}`,
+		);
+	}
+	if (
+		!isString(value.generatedAt) ||
+		!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(
+			value.generatedAt,
+		) ||
+		Number.isNaN(Date.parse(value.generatedAt))
+	) {
+		invalidModelConfig(
+			source,
+			"models.tasksMeta.generatedAt must be an ISO-8601 string",
+		);
+	}
+	if (value.method !== "research" && value.method !== "registry-only") {
+		invalidModelConfig(
+			source,
+			'models.tasksMeta.method must be "research" or "registry-only"',
+		);
+	}
+	return { generatedAt: value.generatedAt, method: value.method };
+}
+
 export function parseModelConfig(
 	rawConfig: any,
 	source = "config.json",
 ): ModelConfig {
-	if (!isPlainObject(rawConfig)) {
+	if (!isPlainObject(rawConfig))
 		invalidModelConfig(source, "root must be an object");
-	}
-
 	const models = rawConfig.models;
 	if (models == null) return { agents: {} };
-	if (!isPlainObject(models)) {
+	if (!isPlainObject(models))
 		invalidModelConfig(source, "models must be an object");
-	}
-
-	const value = models;
-	const allowedKeys = new Set(["default", "agents"]);
-	const unsupportedKeys = Object.keys(value).filter(
+	const allowedKeys = new Set(["default", "agents", "tasks", "tasksMeta"]);
+	const unsupportedKeys = Object.keys(models).filter(
 		(key) => !allowedKeys.has(key),
 	);
-	if (unsupportedKeys.length > 0) {
+	if (unsupportedKeys.length > 0)
 		invalidModelConfig(
 			source,
 			`models has unsupported key(s): ${unsupportedKeys.join(", ")}`,
 		);
-	}
 
 	let defaultModel: string | undefined;
-	if (value.default != null) {
-		if (!isString(value.default) || value.default.trim() === "") {
+	if (models.default != null) {
+		if (!isString(models.default) || models.default.trim() === "")
 			invalidModelConfig(source, "models.default must be a non-empty string");
-		}
-		defaultModel = value.default.trim();
+		const trimmedDefault = models.default.trim();
+		defaultModel = trimmedDefault;
+		rejectTaskReference(trimmedDefault, "models.default", source);
 	}
-
 	const agents: Record<string, string> = {};
-	if (value.agents != null) {
-		if (!isPlainObject(value.agents)) {
+	if (models.agents != null) {
+		if (!isPlainObject(models.agents))
 			invalidModelConfig(source, "models.agents must be an object");
-		}
-		for (const [agent, model] of Object.entries(value.agents)) {
-			if (!isString(model) || model.trim() === "") {
+		for (const [agent, model] of Object.entries(models.agents)) {
+			if (!isString(model) || model.trim() === "")
 				invalidModelConfig(
 					source,
 					`models.agents.${agent} must be a non-empty string`,
 				);
-			}
+			const trimmed = model.trim();
+			rejectTaskReference(trimmed, `models.agents.${agent}`, source);
 			Object.defineProperty(agents, agent, {
-				value: model.trim(),
+				value: trimmed,
 				enumerable: true,
 				writable: true,
 				configurable: true,
 			});
 		}
 	}
-
-	return { default: defaultModel, agents };
+	const tasks = parseTasks(models.tasks, source);
+	const tasksMeta = parseTasksMeta(models.tasksMeta, source);
+	const config: ModelConfig = { agents };
+	if (defaultModel) config.default = defaultModel;
+	if (tasks) config.tasks = tasks;
+	if (tasksMeta) config.tasksMeta = tasksMeta;
+	return config;
 }
 
 export function resolveModelDefault(
@@ -79,34 +181,93 @@ export function resolveModelDefault(
 	config: ModelConfig,
 ): string | undefined {
 	if (agentModel) return agentModel;
-	if (agentName && Object.hasOwn(config.agents, agentName)) {
+	if (agentName && Object.hasOwn(config.agents, agentName))
 		return config.agents[agentName];
-	}
 	return config.default;
 }
 
 export function loadModelConfig(
-	configPath = DEFAULT_MODEL_CONFIG_PATH,
+	configPath = getSubagentsConfigPath(),
 ): ModelConfig {
 	let raw: string;
 	try {
 		raw = readFileSync(configPath, "utf8");
 	} catch (error) {
-		// SAFETY: readFileSync only throws Node's fs errors here, which are
-		// always Error instances carrying an ErrnoException `code`.
-		const errno = error as NodeJS.ErrnoException;
-		if (errno.code === "ENOENT") return { agents: {} };
+		// SAFETY: readFileSync errors expose the Node errno code.
+		if ((error as NodeJS.ErrnoException).code === "ENOENT")
+			return { agents: {} };
 		throw error;
 	}
-
-	let parsed;
 	try {
-		parsed = JSON.parse(raw);
+		return parseModelConfig(JSON.parse(raw), configPath);
 	} catch (error) {
-		const detail = error instanceof Error ? error.message : String(error);
+		if (error instanceof SyntaxError)
+			throw new Error(
+				`Invalid JSON in subagent model config ${configPath}: ${error.message}`,
+			);
+		throw error;
+	}
+}
+
+/** Atomically replace only models.tasks and models.tasksMeta in the durable user config. */
+export function writeTaskModelConfig(
+	configPath: string,
+	examplePath: string,
+	tasks: TaskPreferences,
+	tasksMeta: TaskPreferencesMeta,
+	isAuthenticatedCandidate: (candidate: string) => boolean,
+	fileOperations: Pick<
+		typeof import("node:fs"),
+		"renameSync" | "writeFileSync"
+	> = { renameSync, writeFileSync },
+): void {
+	const candidateConfig = parseModelConfig(
+		{ models: { tasks, tasksMeta } },
+		configPath,
+	);
+	for (const candidates of Object.values(candidateConfig.tasks ?? {})) {
+		for (const candidate of candidates) {
+			if (!isAuthenticatedCandidate(candidate)) {
+				throw new Error(
+					`Task model candidate ${JSON.stringify(candidate)} is not an authenticated exact registry model`,
+				);
+			}
+		}
+	}
+	mkdirSync(dirname(configPath), { recursive: true });
+	const current = readFileIfExists(configPath);
+	const source = current ?? readFileSync(examplePath, "utf8");
+	let parsed: any;
+	try {
+		parsed = JSON.parse(source);
+	} catch (error) {
+		const path = current == null ? examplePath : configPath;
 		throw new Error(
-			`Invalid JSON in subagent model config ${configPath}: ${detail}`,
+			`Invalid JSON in subagent config ${path}: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
-	return parseModelConfig(parsed, configPath);
+	if (!isPlainObject(parsed))
+		throw new Error(
+			`Invalid JSON in subagent config ${configPath}: root must be an object`,
+		);
+	const models = isPlainObject(parsed.models) ? { ...parsed.models } : {};
+	models.tasks = candidateConfig.tasks;
+	models.tasksMeta = candidateConfig.tasksMeta;
+	const output = JSON.stringify({ ...parsed, models }, null, 2) + "\n";
+	const temporary = join(
+		dirname(configPath),
+		`.${Date.now()}-${process.pid}-config.tmp`,
+	);
+	fileOperations.writeFileSync(temporary, output, { flag: "wx" });
+	fileOperations.renameSync(temporary, configPath);
+}
+
+function readFileIfExists(path: string): string | undefined {
+	try {
+		return readFileSync(path, "utf8");
+	} catch (error) {
+		// SAFETY: readFileSync errors expose the Node errno code.
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
 }

@@ -50,7 +50,7 @@ For a worktree launch:
 - Uncommitted and untracked files from the parent checkout are not copied. Commit anything the child must see before spawning it, or pass the needed context in the task.
 - Worktree creation does not steal terminal focus.
 
-For an explicit interactive handoff, use `/worktree <worktree> [task]`. It creates the worktree from the current committed branch, forks the active conversation branch into the target-cwd session, launches a normal long-lived Pi process in the returned root pane, and focuses the destination workspace only after Herdr confirms Pi is running with the expected session and worktree cwd. Use `/worktree list` to inspect worktrees for the current repository. The original process and session remain intact; pane movement is not used to change a running shell's cwd.
+For an explicit interactive handoff, use `/worktree <worktree> [task]`. It creates the worktree from the current committed branch, forks the active conversation branch into the target-cwd session, launches a normal long-lived Pi process in the returned root pane, and focuses the destination workspace only after Herdr confirms Pi is running with the expected session and worktree cwd. Use `/worktree list` to inspect managed worktrees whose source repositories are inside the current cwd subtree, including cross-session orphans. The original process and session remain intact; pane movement is not used to change a running shell's cwd.
 
 `worktree` cannot be set in agent frontmatter and is not exposed by the `/subagent <agent> <task>` shorthand. It is selected per call to the `subagent` tool. Ordered model fallback lists are not supported for worktree subagents: a failed attempt retains its worktree and branch for review, so a retry cannot safely reuse the requested branch. A persistent specialist either holds one worktree lease for its full lifetime or runs read-only in an ordinary pane; it cannot be re-bound.
 
@@ -112,6 +112,7 @@ Possible states are:
 | `ready_for_review` | Child exited successfully; workspace retained |
 | `needs_help` | Child called `caller_ping`; workspace retained |
 | `failed` | Creation, launch, or execution failed; any created workspace is retained |
+| `removed` | Explicit parent cleanup verified checkout absence; branch and manifest retained |
 
 The manifest supports ownership and inspection; v1 does not provide automatic reconciliation after a full Pi/Herdr restart. Do not edit manifests by hand.
 
@@ -131,7 +132,7 @@ The parent receives the normal child summary plus:
 
 `clean` means there are no staged, unstaged, or untracked files. It does **not** mean the branch has no commits or diff relative to its base.
 
-If Git inspection fails, SHA/count/state/file fields are reported as unknown rather than guessed, and the warning is included in the handoff. Inspect the retained workspace directly before integrating or deleting it. Every retained handoff also includes the exact `herdr worktree remove --workspace <workspace-id>` command, but run it only after useful state is preserved.
+If Git inspection fails, SHA/count/state/file fields are reported as unknown rather than guessed, and the warning is included in the handoff. Inspect the retained workspace directly before integrating or deleting it. Every retained handoff points to `/worktree remove` and `worktree_remove`, with the raw Herdr command as an operator override after independent safety checks.
 
 ## Parallel pull-request review without new worktrees
 
@@ -207,21 +208,30 @@ This manual continuation is not watched by the original parent lifecycle. Do not
 
 Worktree and branch cleanup is always explicit. Ordinary temporary reviewer panes close after result delivery; Herdr removes their tab only if its last pane closes. The retained worktree root shell is excluded from automatic cleanup, and user-added panes are preserved. Persistent specialists retain their pane between tasks and follow the existing explicit stop semantics.
 
-First make sure commits, patches, or uncommitted files are no longer needed. Then remove the Herdr worktree workspace:
+Parent sessions have an inspect-only inventory and an explicit removal surface:
 
-```bash
-herdr worktree remove --workspace <workspace-id>
+```text
+/worktree list
+/worktree remove <path|branch|workspace-id> [--preserve]
 ```
 
-Herdr removes the workspace and linked checkout. Without `--force`, dirty worktrees are protected. Do not use `--force` unless discarding all remaining work is intentional and verified.
+The equivalent tools are `worktree_list({})` and `worktree_remove({ target, preserve?: true })`. Use the exact path when a branch name is ambiguous. Children are not offered these tools or `/worktree remove`. Their existing `/worktree list` (repository-local Herdr listing) and `/worktree <name>` handoff remain available. Detached entries are labeled `(detached HEAD)` in the child listing and do not prevent cleanup inspection of named-branch siblings; the detached checkout itself remains blocked.
 
-The branch is a separate Git ref; inspect and delete it separately only when repository policy allows:
+Authorization uses **cwd containment**: the canonical source repository root must equal or descend from the canonical session cwd. It does not use the managed checkout's location or require a current-session manifest. Discovery scans `~/.herdr/worktrees/*/*/`, joins Git registration and Herdr workspace state, and includes orphans from ended sessions. Out-of-scope entries are never removable; unregistered residue and failed probes are unknown, not clean. Inventory includes path, branch, source, workspace, Git state, manifest presence, concrete blockers, and separate process-inspection warnings. The managed root, source, and cwd are canonicalized: symlinked ancestors work normally, but a checkout symlink escaping the managed root is blocked.
 
-```bash
-git branch -d <branch>
-```
+Removal rechecks containment, Git registration, no detected process holder, known live child, or persistent-specialist lease, and no uncommitted, untracked, or conflicted files. Liveness checks observable same-user processes from any session with a cwd inside the checkout, regardless of runtime name (including thread-suffixed Node names). Only Herdr-confirmed idle retained shell PIDs are exempt; an active runtime at the same PID is not. Detached HEAD, locked checkouts, initialized submodules, and conflicting identity evidence block removal. For initialized submodules, deinitialize them deliberately or use operator removal. No force option is provided.
 
-Use `git branch -D` only when you have independently verified that discarding unmerged commits is safe.
+Unreadable individual process details are **warnings, not blockers**, with no override flag. Scanning continues after each unreadable entry, so another observable holder still blocks removal. Unknown processes are not classified as unrelated. Inventory rows expose separate `blockers` and `warnings` arrays; removal results expose `warnings` and retain warnings from earlier inspections, including refusals and preservation/removal failures when available. Human-readable output includes the same warnings, with counts and at most ten sampled PIDs per inspection, not process commands or environments. Pi tool refusals and failures use thrown errors, so their warnings travel in the error message rather than structured tool details.
+
+This is not proof of machine-wide inactivity: same-user inspection is permission-limited, other-user processes are not inspected, and a protected process could hold the checkout undetected. Linux enumerates `/proc` and checks readable cwd paths; disappeared processes and confirmed zombies do not hold a checkout. macOS uses same-user `lsof` cwd records; unreadable or missing details in individual returned records warn, but a failed global `lsof` blocks even when it returns partial output. Neither platform can establish coverage of processes hidden by the OS. Unsupported platforms, failed or empty global enumeration, and unknown Git, containment, or ownership state remain blockers.
+
+Dirty work requires an explicit `--preserve` or `preserve: true`. This stages all uncommitted and untracked files and creates a WIP commit on the retained branch. A failed commit restores the pre-preservation index and leaves the checkout and its uncommitted files in place; removal does not proceed. Success reports the preservation SHA even if the subsequent recheck or removal fails. Conflicts, detached HEAD, and other blockers cannot be bypassed with preservation.
+
+Ignored files do not block cleanup. Inventory shows their exact file count, and a successful removal reports how many were deleted. Counting streams the NUL-delimited Git listing rather than buffering all paths; errors and the 30-second timeout still block removal, never report a guessed zero. Preservation does not capture ignored files; attempted and successful preservation reports disclose that exclusion when ignored files are present.
+
+Open workspaces are removed through Herdr. Git-only orphans use `git worktree remove`, verify checkout absence, and then prune stale Git registrations. Failed removal is reported, never forced. A reachable owned manifest is merge-updated to `removed` with `workspaceRemovedAt` only after success; absent cross-session manifests are reported and are not rewritten. A manifest update failure after removal is a removed-with-warning result, not a failed removal. Removed manifests provide already-removed no-op evidence only; a new checkout at the same path is classified independently. Missing and dangling manifest paths are non-matches. Permission errors, symlink loops, and other undecidable manifest identities remain blockers, as do genuine identity disagreements. Cleanup Git and Herdr calls have 30-second timeouts; a timed-out operation fails closed rather than proceeding with removal.
+
+Branches and their commits are always retained: cleanup never deletes, force-updates, or rewrites a branch. It never runs on completion, shutdown, or a timer. Parent session start emits only one compact inventory count when contained worktrees remain. Unsupported platforms or failed global process enumeration block removal; individual visibility gaps are disclosed warnings, never proof that an orphan is idle.
 
 ## Current limits
 

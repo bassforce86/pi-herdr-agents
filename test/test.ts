@@ -1,4 +1,5 @@
 import { describe, it, before, after } from "node:test";
+import { cleanupFixture } from "./worktree-cleanup-fixture.ts";
 import assert from "node:assert/strict";
 import {
 	existsSync,
@@ -6,6 +7,7 @@ import {
 	writeFileSync,
 	readFileSync,
 	mkdirSync,
+	readdirSync,
 	renameSync,
 	rmSync,
 	utimesSync,
@@ -13,7 +15,8 @@ import {
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { execFileSync } from "node:child_process";
+import childProcess, { execFileSync } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import {
 	createEventBus,
 	SessionManager,
@@ -5369,7 +5372,7 @@ describe("commands", () => {
 		);
 	});
 
-	it("registers /worktree with only its list subcommand", async () => {
+	it("registers /worktree with list and explicit remove usage", async () => {
 		const { api, registeredCommands } = createMockExtensionApi();
 		subagentsModule.default(api);
 
@@ -5393,11 +5396,13 @@ describe("commands", () => {
 		await worktree.handler("list extra", ctx);
 		assert.deepEqual(notifications, [
 			{
-				message: "Usage: /worktree <name> [task] | /worktree list",
+				message:
+					"Usage: /worktree <name> [task] | /worktree list | /worktree remove <target> [--preserve]",
 				level: "warning",
 			},
 			{
-				message: "Usage: /worktree <name> [task] | /worktree list",
+				message:
+					"Usage: /worktree <name> [task] | /worktree list | /worktree remove <target> [--preserve]",
 				level: "warning",
 			},
 		]);
@@ -5468,6 +5473,271 @@ describe("commands", () => {
 		assert.match(sentUserMessages[0], /fork: true/);
 		assert.match(sentUserMessages[0], /interactive: true/);
 		assert.match(sentUserMessages[0], /name: "Iterate"/);
+	});
+});
+
+describe("worktree cleanup public surface", () => {
+	it("delivers process warnings through tool inventory, successful results, and Pi error messages", async () => {
+		for (const status of ["removed", "blocked", "failed"] as const) {
+			const f = cleanupFixture();
+			const warnings = [
+				"Incomplete process coverage: a protected process could hold the checkout undetected.",
+			];
+			f.operations.holders = async () => ({
+				blockers:
+					status === "blocked" ? ["Live process 202 holds the checkout"] : [],
+				warnings,
+			});
+			if (status === "failed")
+				f.operations.removeCheckout = () => {
+					throw new Error("remove refused");
+				};
+			const { api, registeredTools } = createMockExtensionApi();
+			subagentsModule.default(api, { cleanupOperations: () => f.operations });
+			const ctx = { cwd: "/repo" };
+			const inventory = await registeredTools
+				.find((tool) => tool.name === "worktree_list")!
+				.execute("id", {}, undefined, undefined, ctx);
+			assert.deepEqual(inventory.details.entries[0].warnings, warnings);
+			assert.match(inventory.content[0].text, /Warning:.*protected process/);
+			const remove = () =>
+				registeredTools
+					.find((tool) => tool.name === "worktree_remove")!
+					.execute("id", { target: "task" }, undefined, undefined, ctx);
+			if (status === "removed") {
+				const result = await remove();
+				assert.deepEqual(result.details.warnings, warnings);
+				assert.match(result.content[0].text, /Warning:.*protected process/);
+			} else {
+				await assert.rejects(remove, /Warning:.*protected process/);
+				assert.deepEqual(f.calls, []);
+			}
+		}
+	});
+	it("registers parent tools, dispatches list/remove, and reports session-start inventory once", async () => {
+		const f = cleanupFixture();
+		const { api, registeredTools, registeredCommands, eventHandlers } =
+			createMockExtensionApi();
+		subagentsModule.default(api, { cleanupOperations: () => f.operations });
+		const notices: string[] = [];
+		const ctx = {
+			cwd: "/repo",
+			hasUI: true,
+			modelRegistry: { getAvailable: () => [] },
+			ui: { notify: (text: string) => notices.push(text) },
+		};
+		const list = registeredTools.find((tool) => tool.name === "worktree_list");
+		const remove = registeredTools.find(
+			(tool) => tool.name === "worktree_remove",
+		);
+		assert.ok(list);
+		assert.ok(remove);
+		const result = await list.execute("id", {}, undefined, undefined, ctx);
+		assert.equal(result.details.entries[0].classification, "eligible");
+		await eventHandlers.get("session_start")![0]({}, ctx);
+		assert.equal(notices.length, 1);
+		assert.match(notices[0], /1 present · 1 eligible · 0 blocked/);
+		assert.deepEqual(f.calls, []);
+		const command = registeredCommands.find(
+			(item) => item.name === "worktree",
+		)!;
+		await command.handler("remove task", ctx);
+		assert.match(notices.at(-1)!, /Removed/);
+		assert.deepEqual(f.calls, ["git:/repo:/managed/repo/task", "prune:/repo"]);
+		const count = notices.length;
+		await eventHandlers.get("session_start")![0]({}, ctx);
+		assert.equal(notices.length, count);
+	});
+	it("dispatches preserve explicitly from the tool and command", async () => {
+		for (const surface of ["tool", "command"]) {
+			const f = cleanupFixture();
+			f.state.dirtyFiles = 1;
+			const { api, registeredTools, registeredCommands } =
+				createMockExtensionApi();
+			subagentsModule.default(api, { cleanupOperations: () => f.operations });
+			const ctx = { cwd: "/repo", ui: { notify: () => {} } };
+			if (surface === "tool")
+				await registeredTools
+					.find((tool) => tool.name === "worktree_remove")!
+					.execute(
+						"id",
+						{ target: "task", preserve: true },
+						undefined,
+						undefined,
+						ctx,
+					);
+			else
+				await registeredCommands
+					.find((item) => item.name === "worktree")!
+					.handler("remove task --preserve", ctx);
+			assert.equal(f.calls[0], "preserve");
+		}
+	});
+	it("keeps child Herdr list formatting, handoff dispatch, and silent startup", async (t) => {
+		const dir = createTestDir();
+		const previousId = process.env.PI_SUBAGENT_ID;
+		const previousHerdr = process.env.HERDR_ENV;
+		process.env.PI_SUBAGENT_ID = "child";
+		process.env.HERDR_ENV = "1";
+		let worktrees: object[] = [
+			{
+				branch: "feature/topic",
+				path: "/checkout/topic",
+				is_linked_worktree: true,
+				open_workspace_id: "w9",
+			},
+			{ branch: "main", path: "/repo", is_linked_worktree: false },
+			{
+				is_detached: true,
+				path: "/checkout/detached",
+				is_linked_worktree: true,
+			},
+		];
+		const effects: string[][] = [];
+		const availability = t.mock.method(
+			childProcess,
+			"execSync",
+			(command: string) => {
+				assert.equal(command, "command -v herdr");
+				return "/fixture/herdr\n";
+			},
+		);
+		const mocked = t.mock.method(
+			childProcess,
+			"execFileSync",
+			(file: string, args: string[], options: { cwd?: string }) => {
+				effects.push([file, ...args]);
+				if (file === "herdr" && args[0] === "worktree" && args[1] === "list") {
+					assert.deepEqual(args, ["worktree", "list", "--cwd", "/repo"]);
+					return JSON.stringify({
+						result: { type: "worktree_list", worktrees },
+					});
+				}
+				if (file === "git") {
+					assert.deepEqual(args, ["rev-parse", "--verify", "HEAD^{commit}"]);
+					assert.equal(options.cwd, "/repo");
+					return "a".repeat(40);
+				}
+				assert.equal(file, "herdr");
+				assert.deepEqual(args, [
+					"worktree",
+					"create",
+					"--cwd",
+					"/repo",
+					"--branch",
+					"feature/followup",
+					"--base",
+					"a".repeat(40),
+					"--label",
+					"wt: feature/followup",
+					"--no-focus",
+				]);
+				// Stop at the external creation boundary: no real workspace is created.
+				throw new Error("fixture handoff creation stopped");
+			},
+		);
+		syncBuiltinESMExports();
+		try {
+			const { api, registeredCommands, eventHandlers } =
+				createMockExtensionApi();
+			api.getThinkingLevel = () => "medium";
+			subagentsModule.default(api, {
+				cleanupOperations: () => {
+					throw new Error("child must not inspect cleanup inventory");
+				},
+			});
+			const notices: string[] = [];
+			const model = { provider: "fake", id: "test", reasoning: true };
+			let idleWaits = 0;
+			const ctx = {
+				cwd: "/repo",
+				hasUI: true,
+				model,
+				modelRegistry: {
+					find: () => model,
+					getAvailable: () => [model],
+					hasConfiguredAuth: () => true,
+				},
+				ui: { notify: (text: string) => notices.push(text) },
+				waitForIdle: async () => {
+					idleWaits++;
+				},
+				sessionManager: {
+					getSessionFile: () => join(dir, "parent.jsonl"),
+					getLeafId: () => "active-leaf",
+					getSessionId: () => "child",
+					getSessionDir: () => dir,
+				},
+			};
+			await eventHandlers.get("session_start")![0]({}, ctx);
+			assert.deepEqual(notices, []);
+			assert.deepEqual(effects, []);
+			const command = registeredCommands.find(
+				(command) => command.name === "worktree",
+			)!;
+			await command.handler("list", ctx);
+			assert.equal(
+				notices.at(-1),
+				"feature/topic — /checkout/topic (w9)\nmain — /repo\n(detached HEAD) — /checkout/detached",
+			);
+			worktrees = [];
+			await command.handler("list", ctx);
+			assert.equal(notices.at(-1), "No worktrees found.");
+			await command.handler("feature/followup", ctx);
+			assert.equal(idleWaits, 1);
+			assert.equal(
+				notices.at(-1),
+				"Worktree launch failed: fixture handoff creation stopped",
+			);
+			assert.equal(effects.length, 4);
+			const manifestDir = join(dir, "artifacts", "child", "worktree-runs");
+			const manifests = readdirSync(manifestDir);
+			assert.equal(manifests.length, 1);
+			const manifest = JSON.parse(
+				readFileSync(join(manifestDir, manifests[0]), "utf8"),
+			);
+			assert.equal(manifest.branch, "feature/followup");
+			assert.equal(manifest.state, "failed");
+			assert.equal(manifest.sourceCwd, "/repo");
+		} finally {
+			mocked.mock.restore();
+			availability.mock.restore();
+			syncBuiltinESMExports();
+			restoreEnvVar("PI_SUBAGENT_ID", previousId);
+			restoreEnvVar("HERDR_ENV", previousHerdr);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+	it("keeps the child worktree command but rejects removal and hides cleanup tools", async () => {
+		process.env.PI_SUBAGENT_ID = "child";
+		try {
+			const { api, registeredTools, registeredCommands } =
+				createMockExtensionApi();
+			subagentsModule.default(api);
+			assert.equal(
+				registeredTools.some((tool) =>
+					["worktree_list", "worktree_remove"].includes(tool.name),
+				),
+				false,
+			);
+			const command = registeredCommands.find(
+				(command) => command.name === "worktree",
+			)!;
+			assert.ok(command);
+			assert.doesNotMatch(command.description, /remove/);
+			const notices: string[] = [];
+			const ctx = {
+				cwd: "/repo",
+				ui: { notify: (text: string) => notices.push(text) },
+			};
+			await command.handler("", ctx);
+			assert.match(notices.at(-1)!, /<name>.*worktree list/);
+			assert.doesNotMatch(notices.at(-1)!, /remove/);
+			await command.handler("remove task --preserve", ctx);
+			assert.match(notices.at(-1)!, /parent-only/);
+		} finally {
+			delete process.env.PI_SUBAGENT_ID;
+		}
 	});
 });
 
@@ -7312,9 +7582,11 @@ describe("subagent interruption", () => {
 		assert.match(presentation, /Untracked: notes\.txt/);
 		assert.match(
 			presentation,
-			/After review and preservation, remove the workspace with:/,
+			/After review and preservation, explicitly remove/,
 		);
 		assert.match(presentation, /herdr worktree remove --workspace w9/);
+		assert.match(presentation, /\/worktree remove w9/);
+		assert.match(presentation, /worktree_remove/);
 		assert.equal(testApi.shouldRetainSubagentSurface({ worktree }), true);
 		assert.equal(testApi.shouldRetainSubagentSurface({}), false);
 	});
@@ -8121,6 +8393,40 @@ describe("herdr.ts", () => {
 					},
 				],
 			);
+		});
+
+		it("accepts detached entries without a branch but rejects malformed identities", () => {
+			const parse = (
+				row: {
+					path?: string | number | null;
+					branch?: string | number | null;
+					is_detached?: boolean | string;
+					is_linked_worktree?: boolean;
+				} | null,
+			) =>
+				__herdrTest__.parseHerdrWorktreeList(
+					JSON.stringify({
+						result: { type: "worktree_list", worktrees: [row] },
+					}),
+				);
+			assert.deepEqual(
+				parse({
+					path: "/detached",
+					is_detached: true,
+					is_linked_worktree: true,
+				}),
+				[{ branch: "", path: "/detached", isLinkedWorktree: true }],
+			);
+			for (const row of [
+				null,
+				{ path: "/missing-branch" },
+				{ path: "/wrong-flag", is_detached: "true" },
+				{ path: "/wrong-branch", branch: 42, is_detached: true },
+				{ path: "/null-branch", branch: null, is_detached: true },
+				{ path: 42, is_detached: true },
+				{ branch: "main", path: null },
+			])
+				assert.throws(() => parse(row), /Unexpected herdr worktree list entry/);
 		});
 
 		it("accepts only complete, unique pane snapshots", () => {

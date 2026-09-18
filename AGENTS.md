@@ -48,7 +48,7 @@ Preserve these invariants when changing worktree behavior:
 6. Herdr creates the workspace without stealing focus; launch targets the returned root pane explicitly.
 7. Successful, failed, and help-requesting runs retain their worktree workspace.
 8. Completion reports reviewable Git state; inspection failures are unknown, never guessed clean or conflict-free.
-9. The extension does not push, create PRs, merge, cherry-pick, switch the parent checkout, or remove worktrees/branches automatically.
+9. The extension does not push, create PRs, merge, cherry-pick, switch the parent checkout, or remove worktrees automatically. Explicit parent-owned cleanup uses cwd containment and fail-closed eligibility; branches are never deleted.
 10. Ordinary non-worktree subagent behavior remains unchanged.
 
 Read [`docs/worktree-subagents.md`](docs/worktree-subagents.md) before changing any of these semantics.

@@ -106,12 +106,23 @@ function extractHerdrWorktree(output: string): HerdrWorktreeSurface {
 	};
 }
 
-function herdrExec(args: string[]): string {
-	return execFileSync("herdr", args, { encoding: "utf8" });
+function herdrExec(args: string[], timeout?: number): string {
+	return execFileSync("herdr", args, {
+		encoding: "utf8",
+		timeout,
+		killSignal: "SIGKILL",
+	});
 }
 
-async function herdrExecAsync(args: string[]): Promise<string> {
-	const { stdout } = await execFileAsync("herdr", args, { encoding: "utf8" });
+async function herdrExecAsync(
+	args: string[],
+	timeout?: number,
+): Promise<string> {
+	const { stdout } = await execFileAsync("herdr", args, {
+		encoding: "utf8",
+		timeout,
+		killSignal: "SIGKILL",
+	});
 	return stdout;
 }
 
@@ -368,6 +379,7 @@ export function createHerdrGroupedSurface(
 
 /** Worktree records returned by `herdr worktree list`. */
 export interface HerdrWorktreeInfo {
+	/** Empty for a detached HEAD, matching cleanup's Git inspection. */
 	branch: string;
 	path: string;
 	label?: string;
@@ -401,11 +413,16 @@ export function parseHerdrWorktreeList(output: string): HerdrWorktreeInfo[] {
 		throw new Error("Unexpected herdr worktree list output");
 	}
 	return worktrees.map((worktree) => {
-		if (!isString(worktree.branch) || !isString(worktree.path)) {
+		if (
+			!isPlainObject(worktree) ||
+			!isString(worktree.path) ||
+			(!isString(worktree.branch) &&
+				!(worktree.branch === undefined && worktree.is_detached === true))
+		) {
 			throw new Error("Unexpected herdr worktree list entry");
 		}
 		const info: HerdrWorktreeInfo = {
-			branch: worktree.branch,
+			branch: isString(worktree.branch) ? worktree.branch : "",
 			path: worktree.path,
 			isLinkedWorktree: worktree.is_linked_worktree === true,
 		};
@@ -416,10 +433,24 @@ export function parseHerdrWorktreeList(output: string): HerdrWorktreeInfo[] {
 	});
 }
 
-export function listHerdrWorktrees(cwd?: string): HerdrWorktreeInfo[] {
+export function buildWorktreeRemoveArgs(workspaceId: string): string[] {
+	return ["worktree", "remove", "--workspace", workspaceId];
+}
+
+export function removeHerdrWorktree(
+	workspaceId: string,
+	timeout?: number,
+): void {
+	herdrExec(buildWorktreeRemoveArgs(workspaceId), timeout);
+}
+
+export function listHerdrWorktrees(
+	cwd?: string,
+	timeout?: number,
+): HerdrWorktreeInfo[] {
 	const args = ["worktree", "list"];
 	if (cwd) args.push("--cwd", cwd);
-	return parseHerdrWorktreeList(herdrExec(args));
+	return parseHerdrWorktreeList(herdrExec(args, timeout));
 }
 
 function parseHerdrPaneList(output: string, workspaceId: string): string[] {
@@ -666,9 +697,13 @@ export function parseHerdrPaneSnapshot(
 	return result;
 }
 
-export async function listHerdrPanes(): Promise<HerdrPaneListEntry[] | null> {
+export async function listHerdrPanes(
+	timeout?: number,
+): Promise<HerdrPaneListEntry[] | null> {
 	try {
-		return parseHerdrPaneSnapshot(await herdrExecAsync(["pane", "list"]));
+		return parseHerdrPaneSnapshot(
+			await herdrExecAsync(["pane", "list"], timeout),
+		);
 	} catch {
 		return null;
 	}
@@ -755,9 +790,12 @@ export function parsePaneProcessInfo(
 	return result;
 }
 
-export function getHerdrPaneProcessInfo(surface: string): HerdrPaneProcessInfo {
+export function getHerdrPaneProcessInfo(
+	surface: string,
+	timeout?: number,
+): HerdrPaneProcessInfo {
 	return parsePaneProcessInfo(
-		herdrExec(["pane", "process-info", "--pane", surface]),
+		herdrExec(["pane", "process-info", "--pane", surface], timeout),
 		surface,
 	);
 }
@@ -950,6 +988,7 @@ export const __herdrTest__ = {
 	buildTabCreateArgs,
 	buildPaneSplitArgs,
 	buildWorktreeCreateArgs,
+	buildWorktreeRemoveArgs,
 	parseHerdrJson,
 	extractHerdrPaneId,
 	extractHerdrRootPaneId,

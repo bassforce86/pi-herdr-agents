@@ -227,7 +227,7 @@ A worktree completion is a review handoff, not acceptance. For every result:
 4. Resolve dirty/conflicted work before integration.
 5. Merge or cherry-pick according to repository policy, one result at a time.
 6. Re-run affected tests on the destination branch after each integration.
-7. Keep the worktree until the result is accepted and preserved; cleanup is explicit.
+7. Keep the worktree until the result is accepted and preserved. Inspect `/worktree list`, then explicitly use `/worktree remove <target>` or `worktree_remove`. Cleanup requires cwd-contained source repositories, no live child or lease, and clean Git state. Request `--preserve` or `preserve: true` only when a WIP commit is intended. Branches and commits remain retained; unknown state and initialized submodules block cleanup.
 
 The extension does not push, create PRs, merge, or remove worktrees automatically. `subagent_resume` does not reattach worktree tracking; continue follow-up in the retained workspace. See `docs/worktree-subagents.md` when this package's guide is available.
 

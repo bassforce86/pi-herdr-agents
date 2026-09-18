@@ -36,6 +36,7 @@ import {
 	listPanes,
 	waitForShellReady,
 } from "./terminal.ts";
+import { listHerdrWorktrees } from "./herdr.ts";
 import { waitForCompletion } from "./completion.ts";
 import {
 	SupervisionCoordinator,
@@ -104,7 +105,14 @@ import {
 	type SubagentLifecycle,
 	type PaneInspection,
 } from "./lifecycle.ts";
-import { listHerdrWorktrees } from "./herdr.ts";
+import {
+	createWorktreeCleanupOperations,
+	listContainedWorktrees,
+	removeContainedWorktree,
+	formatWorktreeInventory,
+	worktreeInventoryNotice,
+	type WorktreeCleanupOperations,
+} from "./worktree-cleanup.ts";
 import {
 	captureWorktreeHandoff,
 	launchPiSubagent,
@@ -1236,7 +1244,10 @@ function formatWorktreeHandoff(worktree: WorktreeHandoff): string {
 	if (worktree.gitError)
 		lines.push(`Git inspection warning: ${worktree.gitError}`);
 	lines.push(
-		"After review and preservation, remove the workspace with:",
+		"After review and preservation, explicitly remove (branch retained):",
+		`  /worktree remove ${worktree.workspaceId}`,
+		`  worktree_remove({ target: ${JSON.stringify(worktree.path)} })`,
+		"Operator override after independent safety checks:",
 		`  herdr worktree remove --workspace ${worktree.workspaceId}`,
 	);
 	return lines.join("\n");
@@ -3004,8 +3015,33 @@ async function watchSubagentWithFallbacks(
 	}
 }
 
-export default function subagentsExtension(pi: ExtensionAPI) {
+export default function subagentsExtension(
+	pi: ExtensionAPI,
+	options: {
+		cleanupOperations?: (ctx: ExtensionContext) => WorktreeCleanupOperations;
+	} = {},
+) {
 	runtime.pi = pi;
+	const parentSession = !process.env.PI_SUBAGENT_ID;
+	const cleanupInput = (ctx: ExtensionContext) => ({
+		cwd: ctx.cwd,
+		operations:
+			options.cleanupOperations?.(ctx) ??
+			createWorktreeCleanupOperations({
+				manifestDir: join(
+					ctx.sessionManager.getSessionDir(),
+					"artifacts",
+					ctx.sessionManager.getSessionId(),
+					"worktree-runs",
+				),
+				liveHolders: () =>
+					[...runningSubagents.values()].flatMap((child) =>
+						child.worktree
+							? [{ path: child.worktree.path, persistent: child.persistent }]
+							: [],
+					),
+			}),
+	});
 	let btwChild: BtwChild | undefined;
 
 	const closeBtw = async (): Promise<boolean> => {
@@ -3041,7 +3077,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 	// Capture the UI context for widget updates and restore presentation for
 	// subagents whose watchers survived a reload.
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		runtime.latestCtx = ctx;
 		runtime.modelCatalog = buildAuthenticatedModelCatalog(
 			wrapPiModelRegistry(ctx.modelRegistry),
@@ -3058,6 +3094,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			startWidgetRefresh();
 			startStatusRefresh(pi);
 			updateWidget();
+		}
+		if (parentSession && ctx.cwd && ctx.hasUI) {
+			try {
+				const notice = worktreeInventoryNotice(
+					await listContainedWorktrees(cleanupInput(ctx)),
+				);
+				if (notice) ctx.ui.notify(notice, "info");
+			} catch (error) {
+				ctx.ui.notify(
+					`Worktree inventory unavailable: ${error instanceof Error ? error.message : String(error)}`,
+					"warning",
+				);
+			}
 		}
 	});
 
@@ -3101,6 +3150,45 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	);
 
 	const shouldRegister = (name: string) => !deniedTools.has(name);
+
+	if (parentSession) {
+		pi.registerTool({
+			name: "worktree_list",
+			label: "Worktree inventory",
+			description:
+				"Inspect managed worktrees, including cross-session orphans. Only source repositories inside cwd are eligible for explicit removal. This tool never removes anything.",
+			parameters: Type.Object({}),
+			execute: async (_id, _params, _signal, _update, ctx) => {
+				const entries = await listContainedWorktrees(cleanupInput(ctx));
+				return {
+					content: [{ type: "text", text: formatWorktreeInventory(entries) }],
+					details: { entries },
+				};
+			},
+		});
+		pi.registerTool({
+			name: "worktree_remove",
+			label: "Remove worktree",
+			description:
+				"Explicitly remove one managed worktree by exact path, branch, or workspace ID. Rechecks cwd containment, live children/leases, and Git state. Branches and commits are retained. Dirty work requires explicit preserve: true to make a WIP commit first.",
+			parameters: Type.Object({
+				target: Type.String({ minLength: 1 }),
+				preserve: Type.Optional(Type.Boolean()),
+			}),
+			execute: async (_id, params, _signal, _update, ctx) => {
+				const result = await removeContainedWorktree({
+					...cleanupInput(ctx),
+					...params,
+				});
+				if (result.status === "blocked" || result.status === "failed")
+					throw new Error(result.message);
+				return {
+					content: [{ type: "text", text: result.message }],
+					details: result,
+				};
+			},
+		});
+	}
 
 	// ── subagent tool ──
 	if (shouldRegister("subagent"))
@@ -4041,8 +4129,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("worktree", {
-		description:
-			"Fork this session into a worktree; use /worktree list to inspect them",
+		description: parentSession
+			? "Fork into a worktree, list retained worktrees, or explicitly remove one"
+			: "Fork this session into a worktree; use /worktree list to inspect them",
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 			const parts = trimmed.split(/\s+/).filter(Boolean);
@@ -4052,14 +4141,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					return;
 				}
 				try {
-					const worktrees = listHerdrWorktrees(ctx.cwd);
 					ctx.ui.notify(
-						worktrees
-							.map(
-								(worktree) =>
-									`${worktree.branch} — ${worktree.path}${worktree.workspaceId ? ` (${worktree.workspaceId})` : ""}`,
-							)
-							.join("\n") || "No worktrees found.",
+						parentSession
+							? formatWorktreeInventory(
+									await listContainedWorktrees(cleanupInput(ctx)),
+								)
+							: listHerdrWorktrees(ctx.cwd)
+									.map(
+										(worktree) =>
+											`${worktree.branch || "(detached HEAD)"} — ${worktree.path}${worktree.workspaceId ? ` (${worktree.workspaceId})` : ""}`,
+									)
+									.join("\n") || "No worktrees found.",
 						"info",
 					);
 				} catch (error) {
@@ -4071,10 +4163,42 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				return;
 			}
 
+			if (parts[0] === "remove") {
+				if (!parentSession) {
+					ctx.ui.notify("Worktree removal is parent-only.", "warning");
+					return;
+				}
+				const preserve = parts.at(-1) === "--preserve";
+				const target = trimmed
+					.slice("remove".length)
+					.trim()
+					.replace(/\s+--preserve$/, "");
+				if (!target || target === "--preserve") {
+					ctx.ui.notify(
+						"Usage: /worktree remove <path|branch|workspace-id> [--preserve]",
+						"warning",
+					);
+					return;
+				}
+				const result = await removeContainedWorktree({
+					...cleanupInput(ctx),
+					target,
+					preserve,
+				});
+				ctx.ui.notify(
+					result.message,
+					result.status === "removed" || result.status === "already-removed"
+						? "info"
+						: "warning",
+				);
+				return;
+			}
 			const branch = parts.shift();
 			if (!branch || branch === "list") {
 				ctx.ui.notify(
-					"Usage: /worktree <name> [task] | /worktree list",
+					parentSession
+						? "Usage: /worktree <name> [task] | /worktree list | /worktree remove <target> [--preserve]"
+						: "Usage: /worktree <name> [task] | /worktree list",
 					"warning",
 				);
 				return;

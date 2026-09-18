@@ -99,3 +99,40 @@ _Avoid_: Completed agent process, disposable pane, automatic worktree cleanup
 The lifetime-exclusive binding between a persistent specialist generation and
 one managed worktree, when that specialist writes in a worktree.
 _Avoid_: Rebindable checkout, shared worktree ownership
+
+**Worktree inventory**:
+An inspect-only view joining managed checkout discovery, Git registration/state,
+Herdr workspace association, and reachable owned manifests, including orphans.
+_Avoid_: Session-only resource list, cleanup action
+
+**Cwd containment**:
+Cleanup authorization requiring the canonical source repository root to equal or
+be a descendant of the invoking session's canonical cwd.
+_Avoid_: Managed-path containment, manifest ownership authorization
+
+**Cleanup eligibility**:
+Fresh evidence of cwd containment, registered checkout identity, a named branch,
+no detected process holder, known live child, or persistent lease, and clean Git
+state. Only Herdr-confirmed idle retained shells are exempt from process checks,
+never runtimes at the same PID. Ignored files and individual process-visibility
+gaps are disclosed, not blockers. Other unknown evidence blocks removal.
+_Avoid_: Guessed idle, presumed clean
+
+**Process-inspection warning**:
+Non-blocking disclosure of incomplete same-user process visibility, separate
+from cleanup blockers and requiring no override flag. Scanning continues after
+unreadable details; detected holders still block. Other-user processes are not
+inspected, and a protected process could hold the checkout undetected. Failed
+global enumeration and unsupported platforms remain blockers.
+_Avoid_: Proven unrelated, machine-wide inactivity, bypass permission
+
+**Explicit worktree removal**:
+A parent-requested removal of one named managed checkout and its open workspace,
+with absence verification and retained branch history. Never automatic reaping.
+_Avoid_: Branch deletion, completion cleanup
+
+**Dirty-state preservation**:
+Explicit opt-in staging and WIP commitment of a worktree's uncommitted and
+untracked files on its retained branch before rechecking removal eligibility.
+Ignored files are not captured. Commit failure restores the original index.
+_Avoid_: Implicit commit, stash, discard

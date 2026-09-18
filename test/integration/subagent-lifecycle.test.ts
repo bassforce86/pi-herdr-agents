@@ -51,8 +51,9 @@ import {
 } from "./harness.ts";
 
 // Inventory blockers are not command completion; require Pi's warning notification.
+// \s+ between words tolerates Pi's pane-width word wrap in screen captures.
 const dirtyCleanupWarning =
-	/^\s*Warning: Dirty worktree: 1 changed files, 1 untracked;/m;
+	/^\s*Warning:\s+Dirty\s+worktree:\s+1\s+changed\s+files,\s+1\s+untracked;/m;
 const staleDirtyInventory = [
 	"unrelated — /managed/other/task",
 	"Source: /other · workspace: none · manifest: absent",
@@ -562,13 +563,20 @@ for (const backend of backends) {
 					worktree.open_workspace_id,
 					"Completed worktree workspace should remain open",
 				);
-				runInPane(surface, "/worktree list");
-				await waitForScreen(
-					surface,
-					/eligible · Git: 0 dirty/,
-					PI_TIMEOUT,
-					300,
-				);
+				// The completed child's processes may briefly hold the checkout, and
+				// each blocked inventory render is final, so re-issue the command
+				// until the holders exit and the entry becomes eligible.
+				const eligibleEntry = /eligible\s+·\s+Git:\s+0\s+dirty/;
+				const eligibleDeadline = Date.now() + PI_TIMEOUT;
+				for (;;) {
+					runInPane(surface, "/worktree list");
+					try {
+						await waitForScreen(surface, eligibleEntry, 20_000, 300);
+						break;
+					} catch (error) {
+						if (Date.now() >= eligibleDeadline) throw error;
+					}
+				}
 				// Put inventory-shaped stale output on screen on every host, even if
 				// no unrelated dirty managed checkout exists there.
 				runInPane(surface, "/cleanup-inventory-decoy");
@@ -578,7 +586,7 @@ for (const backend of backends) {
 					PI_TIMEOUT,
 					300,
 				);
-				assert.match(decoyScreen, /Dirty worktree:/);
+				assert.match(decoyScreen, /Dirty\s+worktree:/);
 				assert.doesNotMatch(decoyScreen, dirtyCleanupWarning);
 				t.diagnostic(
 					"Stale inventory: old predicate accepts; warning predicate rejects.",
@@ -606,7 +614,7 @@ for (const backend of backends) {
 					encoding: "utf8",
 				}).trim();
 				runInPane(surface, `/worktree remove ${worktree.open_workspace_id}`);
-				await waitForScreen(surface, /commits retained/, PI_TIMEOUT, 300);
+				await waitForScreen(surface, /commits\s+retained/, PI_TIMEOUT, 300);
 				assert.equal(existsSync(worktree.path), false);
 				assert.match(
 					execFileSync("git", ["branch", "--list", branch], {

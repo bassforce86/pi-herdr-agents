@@ -17,6 +17,10 @@ const adversarialReview = readFileSync(
 	"utf8",
 );
 const reviewer = readFileSync(join(root, "agents", "reviewer.md"), "utf8");
+const adversarialAgent = readFileSync(
+	join(root, "agents", "adversarial-reviewer.md"),
+	"utf8",
+);
 const adversarialExample = readFileSync(
 	join(root, "skills", "orchestrate", "adversarial-review-example.js"),
 	"utf8",
@@ -25,6 +29,22 @@ const planSkill = readFileSync(
 	join(root, "pi-extension", "subagents", "plan-skill.md"),
 	"utf8",
 );
+const readme = readFileSync(join(root, "README.md"), "utf8");
+const context = readFileSync(join(root, "CONTEXT.md"), "utf8");
+const normalized = (value) => value.replace(/\s+/g, " ").trim();
+const sectionBetween = (value, start, end) => {
+	const startIndex = value.indexOf(start);
+	const endIndex = value.indexOf(end, startIndex + start.length);
+	assert.notEqual(startIndex, -1, `missing section start: ${start}`);
+	assert.notEqual(endIndex, -1, `missing section end: ${end}`);
+	return normalized(value.slice(startIndex, endIndex));
+};
+const ordinaryReviewClauses = [
+	"For ordinary review, prefer a different authenticated model family.",
+	"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
+	"Disclose that this review is context-isolated, not cross-family independent.",
+	"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+];
 const packageFiles = new Set(
 	JSON.parse(
 		execFileSync("npm", ["pack", "--dry-run", "--json"], {
@@ -218,6 +238,90 @@ describe("bundled orchestration skill", () => {
 		assert.doesNotMatch(adversarialReview, /confidence\s*[><=]/i);
 	});
 
+	it("locks fork override semantics in README and plan-skill", () => {
+		const readmeCompact = normalized(readme);
+		assert.ok(
+			readmeCompact.includes(
+				"`true` forces fork, `false` forces standalone. Omit to inherit",
+			),
+			"README fork parameter must document true/false/omit semantics",
+		);
+		assert.ok(
+			readmeCompact.includes(
+				"`fork: true` on the tool call forces `fork` mode; `fork: false` forces `standalone` mode. Omitting `fork` inherits the agent's frontmatter `session-mode`.",
+			),
+			"README session-mode section must document explicit false override",
+		);
+		const phase7 = sectionBetween(
+			planSkill,
+			"## Phase 7: Review",
+			"## Completion Checklist",
+		);
+		assert.ok(
+			phase7.includes("fork: false,"),
+			"Phase 7 reviewer example must set fork: false",
+		);
+	});
+
+	it("requires fork:false in adversarial-reviewer launch contract", () => {
+		const pinSection = sectionBetween(
+			adversarialAgent,
+			"## Pin the scope and runtimes",
+			"## Launch contract",
+		);
+		assert.ok(
+			pinSection.includes("`fork: false`"),
+			"adversarial-reviewer must set fork: false on every reviewer launch",
+		);
+		assert.ok(
+			/override.*non-standalone|forces? standalone.*regardless/i.test(
+				pinSection,
+			),
+			"adversarial-reviewer must state that fork:false overrides non-standalone role frontmatter",
+		);
+		const item3 = pinSection.slice(
+			pinSection.indexOf("3."),
+			pinSection.indexOf("4."),
+		);
+		assert.doesNotMatch(
+			item3,
+			/stop.*(?:for|if).*non-standalone.*mode/i,
+			"adversarial-reviewer item 3 must not reject solely because role frontmatter declares a non-standalone mode",
+		);
+		assert.ok(
+			/stop.*(?:unknown|cannot be applied|cannot be confirmed)/i.test(
+				pinSection,
+			),
+			"adversarial-reviewer must stop only if the effective mode is unknown or the override cannot be applied",
+		);
+		assert.doesNotMatch(
+			adversarialAgent,
+			/fork: false.*does not override/i,
+			"adversarial-reviewer must not claim fork:false cannot override role mode",
+		);
+	});
+
+	it("requires fork:false in orchestrate skill reviewer launches", () => {
+		const selectSection = sectionBetween(
+			skill,
+			"## 2. Select reviewers",
+			"## 3. Fan out and synthesize",
+		);
+		assert.ok(
+			selectSection.includes("`fork: false`"),
+			"orchestrate SKILL.md reviewer section must require fork: false",
+		);
+		const adversarialTopology = sectionBetween(
+			adversarialReview,
+			"## Topology and models",
+			"## Finding records",
+		);
+		assert.ok(
+			adversarialTopology.includes("`fork: false`"),
+			"adversarial-review.md topology section must require fork: false",
+		);
+	});
+
 	it("pins the Phase 7 reviewer evidence before launch", () => {
 		for (const phrase of [
 			"canonical repository root",
@@ -229,5 +333,66 @@ describe("bundled orchestration skill", () => {
 		]) {
 			assert.ok(planSkill.includes(phrase), `missing review input: ${phrase}`);
 		}
+	});
+
+	it("states the authenticated-family ordinary-review gate in /plan", () => {
+		const compact = normalized(planSkill);
+		assert.ok(compact.includes("Phase 7 uses ordinary review."));
+		for (const clause of ordinaryReviewClauses)
+			assert.ok(compact.includes(clause), `/plan must include: ${clause}`);
+		assert.doesNotMatch(compact, /do not disclose/i);
+	});
+
+	it("defines independent and ordinary review separately in README and CONTEXT", () => {
+		const independentClause =
+			"Cross-family independent review requires a reviewer from a different model family than the author.";
+		for (const [label, content] of [
+			["README", readme],
+			["CONTEXT", context],
+		]) {
+			const compact = normalized(content);
+			assert.ok(
+				compact.includes(independentClause),
+				`${label} must define independent review as a requirement`,
+			);
+			for (const clause of ordinaryReviewClauses)
+				assert.ok(compact.includes(clause), `${label} must include: ${clause}`);
+		}
+		assert.doesNotMatch(
+			readme,
+			/Independent reviewers should use/i,
+			"README must not weaken independent review to a suggestion",
+		);
+		assert.doesNotMatch(
+			readme,
+			/For review when the authoring family is known, choose an exact shortlist ID[^.]*task:review`; this is guidance/i,
+			"README must replace the unconditional task:review paragraph",
+		);
+	});
+
+	it("keeps all three README review passages aligned with the taxonomy", () => {
+		const passages = [
+			sectionBetween(
+				readme,
+				"Bundled agents use model defaults",
+				"Discovery loads definitions",
+			),
+			sectionBetween(
+				readme,
+				"`models.tasks` candidates are ordered exact authenticated IDs.",
+				"Run `/subagents-init",
+			),
+			sectionBetween(
+				readme,
+				"Shortlists do not enforce reviewer independence.",
+				"Set `persistent.maxAgents`",
+			),
+		];
+		for (const [index, passage] of passages.entries())
+			for (const clause of ordinaryReviewClauses)
+				assert.ok(
+					passage.includes(clause),
+					`README passage ${index + 1} must include: ${clause}`,
+				);
 	});
 });

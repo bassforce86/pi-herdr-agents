@@ -108,6 +108,7 @@ function extractHerdrWorktree(output: string): HerdrWorktreeSurface {
 
 function herdrExec(args: string[], timeout?: number): string {
 	return execFileSync("herdr", args, {
+		stdio: "pipe",
 		encoding: "utf8",
 		timeout,
 		killSignal: "SIGKILL",

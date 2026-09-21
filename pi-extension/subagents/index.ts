@@ -3131,7 +3131,7 @@ export default function subagentsExtension(
 			startStatusRefresh(pi);
 			updateWidget();
 		}
-		if (parentSession && ctx.cwd && ctx.hasUI) {
+		if (parentSession && ctx.cwd && ctx.hasUI && isTerminalAvailable()) {
 			try {
 				const notice = worktreeInventoryNotice(
 					await listContainedWorktrees(cleanupInput(ctx)),

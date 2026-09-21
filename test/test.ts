@@ -21,7 +21,7 @@ import {
 } from "../pi-extension/subagents/config-path.ts";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import childProcess, { execFileSync } from "node:child_process";
+import childProcess, { execFileSync, spawnSync } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import {
 	createEventBus,
@@ -6320,6 +6320,29 @@ describe("commands", () => {
 });
 
 describe("worktree cleanup public surface", () => {
+	it("skips startup inventory outside Herdr", async (t) => {
+		const previousHerdr = process.env.HERDR_ENV;
+		t.after(() => restoreEnvVar("HERDR_ENV", previousHerdr));
+		for (const herdrEnv of [undefined, "0"]) {
+			restoreEnvVar("HERDR_ENV", herdrEnv);
+			const f = cleanupFixture();
+			const scan = t.mock.method(f.operations, "scan");
+			const { api, eventHandlers } = createMockExtensionApi();
+			subagentsModule.default(api, { cleanupOperations: () => f.operations });
+			const notices: string[] = [];
+			await eventHandlers.get("session_start")![0](
+				{},
+				{
+					cwd: "/repo",
+					hasUI: true,
+					modelRegistry: { find: () => undefined, getAvailable: () => [] },
+					ui: { notify: (text: string) => notices.push(text) },
+				},
+			);
+			assert.deepEqual(notices, []);
+			assert.equal(scan.mock.callCount(), 0);
+		}
+	});
 	it("delivers process warnings through tool inventory, successful results, and Pi error messages", async () => {
 		for (const status of ["removed", "blocked", "failed"] as const) {
 			const f = cleanupFixture();
@@ -6357,7 +6380,16 @@ describe("worktree cleanup public surface", () => {
 			}
 		}
 	});
-	it("registers parent tools, dispatches list/remove, and reports session-start inventory once", async () => {
+	it("registers parent tools, dispatches list/remove, and reports session-start inventory once", async (t) => {
+		const previousHerdr = process.env.HERDR_ENV;
+		process.env.HERDR_ENV = "1";
+		t.mock.method(childProcess, "execSync", () => "/fixture/herdr\n");
+		syncBuiltinESMExports();
+		t.after(() => {
+			restoreEnvVar("HERDR_ENV", previousHerdr);
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+		});
 		const f = cleanupFixture();
 		const { api, registeredTools, registeredCommands, eventHandlers } =
 			createMockExtensionApi();
@@ -9402,6 +9434,45 @@ describe("subagents widget rendering", () => {
 });
 
 describe("herdr.ts", () => {
+	it("captures failed CLI stderr without leaking it to the parent terminal", () => {
+		const dir = createTestDir();
+		try {
+			writeFileSync(
+				join(dir, "herdr"),
+				'#!/bin/sh\nprintf \'{"error":{"code":"server_not_running"}}\\n\' >&2\nexit 1\n',
+				{ mode: 0o755 },
+			);
+			const moduleUrl = new URL(
+				"../pi-extension/subagents/herdr.ts",
+				import.meta.url,
+			).href;
+			const result = spawnSync(
+				process.execPath,
+				[
+					"--experimental-strip-types",
+					"--input-type=module",
+					"-e",
+					`
+				import { listHerdrWorktrees } from ${JSON.stringify(moduleUrl)};
+				try {
+					listHerdrWorktrees();
+					process.exitCode = 2;
+				} catch (error) {
+					if (error.status !== 1 || !String(error.stderr).includes("server_not_running")) throw error;
+				}
+			`,
+				],
+				{
+					encoding: "utf8",
+					env: { ...process.env, PATH: dir, NODE_NO_WARNINGS: "1" },
+				},
+			);
+			assert.equal(result.status, 0, result.stderr);
+			assert.equal(result.stderr, "");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
 	describe("isHerdrAvailable", () => {
 		it("returns boolean based on HERDR_ENV", () => {
 			const result = isHerdrAvailable();

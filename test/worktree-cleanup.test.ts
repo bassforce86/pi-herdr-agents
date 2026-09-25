@@ -25,7 +25,6 @@ import {
 	__worktreeCleanupTest__,
 	listContainedWorktrees,
 	removeContainedWorktree,
-	worktreeInventoryNotice,
 	formatWorktreeInventory,
 } from "../pi-extension/subagents/worktree-cleanup.ts";
 import { cleanupFixture } from "./worktree-cleanup-fixture.ts";
@@ -1212,17 +1211,6 @@ describe("explicit worktree cleanup", () => {
 			"already-removed",
 		);
 		assert.deepEqual(f.calls, []);
-	});
-	it("counts contained worktrees only, without mutation, and stays silent at zero", async () => {
-		const f = cleanupFixture();
-		const rows = await listContainedWorktrees(f.input);
-		assert.match(
-			worktreeInventoryNotice(rows)!,
-			/1 present · 1 eligible · 0 blocked/,
-		);
-		assert.equal(worktreeInventoryNotice([]), undefined);
-		assert.deepEqual(f.calls, []);
-		assert.deepEqual(cleanupBlockers(rows[0]), []);
 	});
 	it("removal args contain only the explicit workspace selector", () => {
 		assert.deepEqual(__herdrTest__.buildWorktreeRemoveArgs("w1"), [

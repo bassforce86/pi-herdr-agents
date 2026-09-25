@@ -223,17 +223,6 @@ export function formatWorktreeInventory(
 	);
 }
 
-export function worktreeInventoryNotice(
-	rows: WorktreeInventoryEntry[],
-): string | undefined {
-	const present = rows.filter((row) => row.contained);
-	if (!present.length) return undefined;
-	const eligible = present.filter(
-		(row) => row.classification === "eligible",
-	).length;
-	return `Worktrees: ${present.length} present · ${eligible} eligible · ${present.length - eligible} blocked. /worktree list`;
-}
-
 export async function removeContainedWorktree(
 	input: CleanupInput & { target: string; preserve?: boolean },
 ): Promise<WorktreeRemovalResult> {

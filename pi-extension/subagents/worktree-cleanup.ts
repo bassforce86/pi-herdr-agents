@@ -214,7 +214,12 @@ export function formatWorktreeInventory(
 	rows: WorktreeInventoryEntry[],
 ): string {
 	return (
-		rows
+		[...rows]
+			.sort(
+				(a, b) =>
+					Number(a.contained) - Number(b.contained) ||
+					a.path.localeCompare(b.path),
+			)
 			.map(
 				(row) =>
 					`${row.branch ?? "unknown branch"} — ${row.path}\nSource: ${row.sourceRepo ?? "unknown"} · workspace: ${row.workspaceId ?? "none"} · manifest: ${row.manifest.length ? row.manifest.map(({ value }) => value.state ?? "unknown").join(", ") : "absent"}\n${row.classification} · Git: ${row.git ? `${row.git.dirtyFiles} dirty, ${row.git.untrackedFiles} untracked, ${row.git.ignoredFiles} ignored, ${row.git.conflicts} conflicts` : "unknown"}${row.blockers.length ? ` · ${row.blockers.join("; ")}` : " · clean"}${row.warnings.length ? `\nWarning: ${row.warnings.join("; ")}` : ""}`,

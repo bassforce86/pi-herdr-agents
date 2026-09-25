@@ -800,6 +800,20 @@ describe("explicit worktree cleanup", () => {
 		assert.equal(row.sourceRepo, "/repo");
 		assert.deepEqual(row.manifest, []);
 		assert.match(formatWorktreeInventory([row]), /manifest: absent/);
+		const inventory = formatWorktreeInventory([
+			{ ...row, path: "/managed/inside", branch: "inside" },
+			{
+				...row,
+				path: "/managed/outside",
+				branch: "outside",
+				contained: false,
+				classification: "out-of-scope",
+			},
+		]);
+		assert.ok(
+			inventory.indexOf("outside —") < inventory.indexOf("inside —"),
+			"in-scope rows stay at the end of large inventories",
+		);
 		assert.deepEqual(f.calls, []);
 	});
 	for (const [name, patch, blocker] of [

@@ -552,6 +552,8 @@ function processHolders(
 	const blockers: string[] = [];
 	const unreadable = new Set<string>();
 	const shellNames = new Set(["bash", "zsh", "fish", "sh", "dash"]);
+	const checkout =
+		platform === "linux" || platform === "darwin" ? realpathSync(path) : path;
 	if (!process.getuid) throw new Error("Process user identity unavailable");
 	const uid = process.getuid();
 	if (platform === "linux") {
@@ -571,7 +573,7 @@ function processHolders(
 				// A shell can exec a runtime without changing PID/process group.
 				if (idleShellPids.has(Number(pid)) && shellNames.has(command)) continue;
 				const cwd = realpathSync(`${procRoot}/${pid}/cwd`);
-				if (contained(path, cwd))
+				if (contained(checkout, cwd))
 					blockers.push(`Live process ${pid} holds the checkout`);
 			} catch (error) {
 				// SAFETY: filesystem probes throw Node errors with an optional errno code.
@@ -644,7 +646,7 @@ function processHolders(
 			try {
 				if (!cwd || !isAbsolute(cwd))
 					throw new Error("Process cwd unavailable");
-				if (contained(path, realpathSync(cwd)))
+				if (contained(checkout, realpathSync(cwd)))
 					blockers.push(`Live process ${pid} holds the checkout`);
 			} catch {
 				unreadable.add(pid);

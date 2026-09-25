@@ -494,8 +494,10 @@ describe("cleanup operating-system probes", () => {
 				cwd: source,
 				operations: ops,
 			});
-			const clean = rows.find((row) => row.path === alpha)!;
-			const detached = rows.find((row) => row.path === delta)!;
+			const clean = rows.find((row) => row.path === fs.realpathSync(alpha));
+			const detached = rows.find((row) => row.path === fs.realpathSync(delta));
+			assert.ok(clean, `Missing ${alpha}: ${JSON.stringify(rows)}`);
+			assert.ok(detached, `Missing ${delta}: ${JSON.stringify(rows)}`);
 			assert.equal(clean.classification, "eligible");
 			assert.deepEqual(clean.blockers, []);
 			assert.equal(detached.classification, "blocked");
@@ -723,8 +725,8 @@ describe("cleanup operating-system probes", () => {
 				operations: ops,
 			});
 			assert.equal(row.classification, "eligible");
-			assert.equal(row.path, path);
-			assert.equal(row.sourceRepo, join(dir, "real"));
+			assert.equal(row.path, fs.realpathSync(path));
+			assert.equal(row.sourceRepo, fs.realpathSync(join(dir, "real")));
 			symlinkSync(dir, join(root, "repo", "escape"));
 			const escaped = (
 				await listContainedWorktrees({ cwd: dir, operations: ops })

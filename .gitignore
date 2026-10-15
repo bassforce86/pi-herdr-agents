@@ -1,4 +1,5 @@
 node_modules/
+.devenv/
 config.json
 .reviews/
 .pi/*

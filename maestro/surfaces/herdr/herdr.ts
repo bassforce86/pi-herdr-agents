@@ -1204,11 +1204,11 @@ export async function waitForHerdrShellReady(
 		signal?: AbortSignal;
 	} = {},
 ): Promise<void> {
-	// Hooks such as a cold direnv/nix shell can take minutes to finish.
+	// Opt-in override for hooks (e.g. a cold direnv/nix shell) that need longer.
 	const envTimeout = Number(process.env.PI_HERDR_SHELL_READY_TIMEOUT_MS);
 	const timeoutMs =
 		options.timeoutMs ??
-		(Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : 300_000);
+		(Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : 10_000);
 	const intervalMs = options.intervalMs ?? 50;
 	const deadline = Date.now() + timeoutMs;
 	let lastError = "no interactive shell foreground process";

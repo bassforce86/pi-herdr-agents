@@ -327,25 +327,31 @@ reach Herdr, so a token still expires at most 15 seconds after the last write
 Herdr accepted. Setting it back to `true` marks only later launches; a child
 that was already running when you turned it off is never marked again.
 
-With markers on, every fresh, resumed, and persistent child records its own
-process identity, as managed worktree children always do. After the parent
-verifies that identity, it reports the pane token `piha_delegated_v1` with the
-value `live`, a 15-second time-to-live, and an increasing sequence number
-through `HERDR_SOCKET_PATH`. It renews the token on supervision checks while
-that exact process is alive. It clears the token when the run finalizes or is
-suppressed, or when the process exits or can no longer be verified. A
-`/worktree` handoff session is never marked.
+With markers on, the parent reads each fresh, resumed, persistent, or managed
+worktree child's pane with `pane.get` through `HERDR_SOCKET_PATH`. Once Herdr
+reports the child's own session file as the pane's `agent_session`, within 15
+seconds of launch, the parent reports the pane token `piha_delegated_v1` with
+the value `live`, a 15-second time-to-live, and an increasing sequence number.
+It renews the token on supervision checks, each time only after Herdr still
+reports that session. Herdr learns each Pi's session from its own Pi
+integration (`herdr integration install pi`), and drops it when that Pi exits
+or is suspended back to the shell prompt, so without the integration nothing is
+marked. The parent clears the token when the run finalizes or is suppressed, or
+when Herdr no longer reports the child's session. A `/worktree` handoff session
+is never marked.
 
-Marker writes never fail a launch or keep Pi running. Each write has a 2-second
-timeout on an unreferenced socket, failed writes are not retried, and three
-failures in a row stop that child's marker. Process identity reads Linux
-`/proc`, so on other systems, and outside Herdr, nothing is marked. After a
-parent crash, a marker can remain for up to 15 seconds after the last write
-Herdr applied. A marker belongs to the pane, so a different process started by
-hand in a delegated pane stays hidden by Focus while the original process is
-alive and supervised, even if it is suspended. Run All first or use a fresh
-pane. See [what a marker proves](../plugins/sidebar/README.md#what-a-marker-proves)
-and [reusing a delegated pane](../plugins/sidebar/README.md#reusing-a-delegated-pane).
+Marker reads and writes never fail a launch or keep Pi running. Each has a
+2-second timeout on an unreferenced socket. Before the marker is live, a failed
+read is retried every 250 milliseconds until the 15-second discovery window
+ends. Once it is live, failures are not retried, and three failed renewal
+reads or writes in a row stop that child's marker. Markers work on Linux and macOS;
+outside Herdr nothing is marked. After a parent crash, a marker can remain for
+up to 15 seconds after the last write Herdr applied. A marker belongs to the
+pane, so after the child exits or is suspended, an agent started by hand in
+that pane can stay hidden by Focus until the next renewal clears the marker,
+usually within 5 seconds. See
+[what a marker proves](../plugins/sidebar/README.md#what-a-marker-proves) and
+[reusing a delegated pane](../plugins/sidebar/README.md#reusing-a-delegated-pane).
 
 ## Supervision transport
 

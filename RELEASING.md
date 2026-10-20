@@ -43,7 +43,7 @@ Manual deterministic Herdr integration (required before you push a release commi
 npm run test:integration
 ```
 
-Run that suite from inside Herdr. It uses real Pi and Herdr processes with the local deterministic provider, so it needs no provider credentials or network access. `test/integration/sidebar.test.ts` also starts two disposable Herdr servers with their own HOME, configuration, sockets, and plugin registry under the system temporary directory, and removes them afterwards. It needs Linux and skips elsewhere.
+Run that suite from inside Herdr. It uses real Pi and Herdr processes with the local deterministic provider, so it needs no provider credentials or network access. `test/integration/sidebar.test.ts` also starts two disposable Herdr servers with their own HOME, configuration, sockets, and plugin registry under the system temporary directory, installs Herdr's Pi integration into that HOME, runs real `pi` processes there, and removes them afterwards. It needs Linux and a `pi` binary (`PI_BIN` overrides the one on `PATH`) and skips otherwise. `test/integration/sidebar-lifecycle.test.ts` installs the same integration into its isolated agent directory.
 
 The optional live-provider smoke test is not a release gate:
 

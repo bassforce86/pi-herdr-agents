@@ -66,7 +66,7 @@ After the package exists on npm, steady-state releases use npm trusted publishin
    - Workflow filename: `publish.yml`
    - Allowed action: `npm publish`
 3. Confirm the release job has `permissions.id-token: write` and runs on a GitHub-hosted runner (already set in `.github/workflows/publish.yml`).
-4. Confirm the workflow uses the exactly pinned Node `26.3.0`, whose bundled npm supports trusted publishing.
+4. Confirm the workflow uses the exactly pinned Node `26.12.1`, whose bundled npm supports trusted publishing.
 5. Publish stays tokenless: `npm publish --access public --provenance`.
 
 When the repository secret `NPM_TOKEN` is absent, the publish step unsets `NODE_AUTH_TOKEN` and relies on OIDC. Once the package exists, the workflow fails if `NPM_TOKEN` is still configured, so steady-state releases cannot silently keep using the bootstrap credential. Manual dispatch runs only from `main`; other refs are rejected.

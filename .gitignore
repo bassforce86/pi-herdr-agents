@@ -4,4 +4,14 @@ config.json
 .pi/*
 !.pi/skills/
 !.pi/settings.json
-.pi-lens-probe-home/
+
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml

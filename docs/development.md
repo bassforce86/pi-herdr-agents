@@ -37,6 +37,9 @@ provider; fakes are for conformance tests only.
   config loaders with injected directories, and task-model init prompt logic.
 - `maestro/core/worktree.ts`, `maestro/core/worktree-cleanup.ts` — manifest
   schema/state, handoff types, and cleanup eligibility/formatting.
+- `maestro/core/realpath-without-opening.ts` — lstat/stat/readlink realpath for
+  cleanup canonicalization and Herdr checkout comparisons; avoids Bun `open()`
+  freezes on protected directories.
 - `maestro/core/git-environment.ts` removes inherited repository-selection and
   command-local Git configuration overrides from host-managed Git subprocesses.
   It retains user configuration, identity, and hooks.
@@ -72,7 +75,13 @@ provider; fakes are for conformance tests only.
   client for pane metadata. The CLI driver is `herdr-cli.ts` (exec, JSON,
   availability, test exec hook), `herdr-pane.ts` (pane inspection, process
   info, readiness and absence waits), and `herdr.ts` (placement, worktrees,
-  the opened-primary report, pane commands).
+  the opened-primary report, pane commands). On Windows a launch script runs
+  through an absolute bash path spelled for the pane's shell
+  (`maestro/core/script-launch.ts` builds the PowerShell, cmd or Git Bash
+  line; `terminal.ts` reads the shell from `pane process-info`;
+  `maestro/adapters/pi/script-shell.ts` resolves the path with Pi's
+  `shellPath` setting for the launching session's cwd and project trust, then
+  bash-tool discovery) so a bare `bash` never resolves to the WSL launcher.
 - `maestro/runtime/` — run ownership, controls/retries, observation,
   delivery-gated cleanup, Pi composition, worktree operations/handoff,
   task-model init composition, and sidebar markers (`delegated-marker.ts`).
